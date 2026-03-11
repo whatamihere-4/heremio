@@ -34,7 +34,6 @@ def get_auth_key():
         print("Please add them to your .env file and try again.")
         return None
 
-    #if DEBUG_MODE:
     print("Logging in to Stremio as {}...".format(email))
 
     url = "https://api.strem.io/api/login"
@@ -65,7 +64,6 @@ def get_auth_key():
             print("Your STREMIO_AUTH key is:")
             print(auth_key)
             print("===============\n")
-            print("You can copy this key and update STREMIO_AUTH in your .env file.")
         
         return auth_key
 
