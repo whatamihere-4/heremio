@@ -1,0 +1,6 @@
+.env
+test/
+__pycache__
+heremio.xml
+Dockerfile
+docker-compose.yml
