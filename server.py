@@ -472,7 +472,19 @@ PORT = 9000
 # ---------------------------------------------------------------------------
 library_items = []   # list of dicts from Stremio
 item_by_idx = {}     # idx → item dict
+
+CACHE_FILE = "stash_cache.json"
 STASH_CACHE = {}     # Cache for StashDB queries {"Site - Title": stashdb_dict}
+
+# Load existing cache from disk
+if os.path.exists(CACHE_FILE):
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            STASH_CACHE = json.load(f)
+        if DEBUG_MODE:
+            print(f"Loaded {len(STASH_CACHE)} entries from {CACHE_FILE}")
+    except Exception as e:
+        print(f"Error loading {CACHE_FILE}: {e}")
 
 
 def fetch_library():
@@ -547,12 +559,15 @@ def query_stashdb(site: str, clean_title: str):
     }
     """
     
-    # Text query approach using Site + Clean title
+    # Use BOTH site and title in the text query to avoid broad mismatches
+    # e.g. "The Student" vs "DarkRoomVR The Student"
+    search_text = f"{site} {clean_title}" if site else clean_title
+
     payload = {
         "query": query,
         "variables": {
             "input": {
-                "text": clean_title
+                "text": search_text
             }
         }
     }
@@ -563,13 +578,29 @@ def query_stashdb(site: str, clean_title: str):
             data = response.json()
             scenes = data.get("data", {}).get("queryScenes", {}).get("scenes", [])
             if scenes:
+                # We could ideally filter scenes by exact studio match, but StashDB's 
+                # text search with the site name included usually ranks the right one first
                 first_match = scenes[0]
                 STASH_CACHE[cache_key] = first_match
-                debug_print(f"✅ StashDB match found: {first_match.get('title')}")
+                
+                # Save to disk
+                try:
+                    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(STASH_CACHE, f, indent=2)
+                except Exception as e:
+                    debug_print(f"Error saving to {CACHE_FILE}: {e}")
+                    
+                debug_print(f"✅ StashDB match found: {first_match.get('title')} (Studio: {first_match.get('studio', {}).get('name')})")
                 return first_match
             else:
                 debug_print("❌ No StashDB results found.")
                 STASH_CACHE[cache_key] = None
+                # Save the "not found" state too so we don't spam StashDB
+                try:
+                    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(STASH_CACHE, f, indent=2)
+                except Exception as e:
+                    debug_print(f"Error saving to {CACHE_FILE}: {e}")
         else:
             debug_print(f"⚠️ StashDB HTTP Error {response.status_code}: {response.text}")
     except Exception as e:
