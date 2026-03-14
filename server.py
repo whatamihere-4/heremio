@@ -587,13 +587,22 @@ def query_stashdb(site: str, clean_title: str):
     }
 
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
+        response = requests.post(url, json=payload, headers=headers, timeout=20)
         if response.status_code == 200:
             data = response.json()
             scenes = data.get("data", {}).get("queryScenes", {}).get("scenes", [])
+            
+            # Fallback to just the title if site + title yielded zero results
+            if not scenes and site:
+                debug_print(f"❌ No results for '{search_text}'. Retrying with just title: '{clean_title}'")
+                payload["variables"]["input"]["text"] = clean_title
+                response_fb = requests.post(url, json=payload, headers=headers, timeout=20)
+                if response_fb.status_code == 200:
+                    data_fb = response_fb.json()
+                    scenes = data_fb.get("data", {}).get("queryScenes", {}).get("scenes", [])
+
             if scenes:
-                # We could ideally filter scenes by exact studio match, but StashDB's 
-                # text search with the site name included usually ranks the right one first
+                # We could ideally filter scenes by exact studio match, but usually ranks the right one first
                 first_match = scenes[0]
                 STASH_CACHE[cache_key] = first_match
                 
@@ -617,6 +626,9 @@ def query_stashdb(site: str, clean_title: str):
                     debug_print(f"Error saving to {CACHE_FILE}: {e}")
         else:
             debug_print(f"⚠️ StashDB HTTP Error {response.status_code}: {response.text}")
+    except requests.exceptions.Timeout:
+        debug_print(f"⚠️ StashDB Query Timeout for '{search_text}'. Will retry next session.")
+        # Do deliberately NOT cache `None` here, so the script can try again later!
     except Exception as e:
         debug_print(f"⚠️ StashDB Query Exception: {e}")
     finally:
@@ -658,7 +670,7 @@ def query_stashdb_by_id(scene_id: str):
     }
 
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
+        response = requests.post(url, json=payload, headers=headers, timeout=20)
         if response.status_code == 200:
             data = response.json()
             scene = data.get("data", {}).get("findScene")
