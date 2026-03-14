@@ -13,7 +13,8 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import ssl
-from flask import Flask, request, jsonify, make_response
+import threading
+from flask import Flask, request, jsonify, make_response, render_template_string
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -164,6 +165,9 @@ def _parse_bracketed(filename: str) -> dict:
                 title = before_paren
             else:
                 performers = _extract_performers(before_paren)
+                if performers and title:
+                    # Mux NaughtyAmerica format (Performers - Series)
+                    title = f"{', '.join(performers)} - {title}"
     else:
         # No parentheses — find title from text before first tag bracket
         first_bracket = re.search(r'\[', rest)
@@ -440,7 +444,7 @@ RD_TOKEN       = os.environ.get("RD_TOKEN", "")
 
 def debug_print(msg):
     if DEBUG_MODE:
-        print(f"🛠️ [DEBUG] {msg}")
+        print(f"🛠️ [DEBUG] {msg}", flush=True)
 
 # Derive the PTube addon base URLs from the manifest URL
 PTUBE_BASE = PTUBE_MANIFEST.rsplit("/manifest.json", 1)[0]
@@ -477,8 +481,9 @@ PORT = 9000
 library_items = []   # list of dicts from Stremio
 item_by_idx = {}     # idx → item dict
 
-CACHE_FILE = "stash_cache.json"
+CACHE_FILE = "cache.json"
 STASH_CACHE = {}     # Cache for StashDB queries {"Site - Title": stashdb_dict}
+STASH_PENDING = set() # Track keys currently being queried
 
 # Load existing cache from disk
 if os.path.exists(CACHE_FILE):
@@ -541,6 +546,11 @@ def query_stashdb(site: str, clean_title: str):
     if cache_key in STASH_CACHE:
         debug_print(f"Loaded {cache_key} from STASH_CACHE")
         return STASH_CACHE[cache_key]
+        
+    if cache_key in STASH_PENDING:
+        return None
+        
+    STASH_PENDING.add(cache_key)
 
     # Use BOTH site and title in the text query to avoid broad mismatches
     # e.g. "The Student" vs "DarkRoomVR The Student"
@@ -609,8 +619,102 @@ def query_stashdb(site: str, clean_title: str):
             debug_print(f"⚠️ StashDB HTTP Error {response.status_code}: {response.text}")
     except Exception as e:
         debug_print(f"⚠️ StashDB Query Exception: {e}")
+    finally:
+        STASH_PENDING.discard(cache_key)
         
     return None
+
+def query_stashdb_by_id(scene_id: str):
+    """
+    Search StashDB using a specific Scene ID and return structured HereSphere metadata if found.
+    """
+    if not STASHDB_API_KEY:
+        return None
+
+    debug_print(f"Querying StashDB by ID: '{scene_id}'")
+    url = "https://stashdb.org/graphql"
+    headers = {
+        "Content-Type": "application/json",
+        "ApiKey": STASHDB_API_KEY
+    }
+
+    query = """
+    query FindScene($id: ID!) {
+      findScene(id: $id) {
+        title
+        date
+        studio { name }
+        performers { performer { name } }
+        tags { name }
+      }
+    }
+    """
+    
+    payload = {
+        "query": query,
+        "variables": {
+            "id": scene_id
+        }
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            scene = data.get("data", {}).get("findScene")
+            if scene:
+                debug_print(f"✅ StashDB match found by ID: {scene.get('title')}")
+                return scene
+            else:
+                debug_print("❌ No StashDB results found for ID.")
+        else:
+            debug_print(f"⚠️ StashDB HTTP Error {response.status_code}: {response.text}")
+    except Exception as e:
+        debug_print(f"⚠️ StashDB Query Exception: {e}")
+        
+    return None
+
+def fill_stash_cache_background():
+    """
+    Background worker that runs on startup.
+    Finds all movies in the library that don't have a StashDB cache entry yet,
+    and queries StashDB for them one by one with a rate limit.
+    """
+    if not STASHDB_API_KEY:
+        return
+        
+    to_fetch = []
+    
+    # Identify items missing from cache
+    for item in library_items:
+        raw_name = item.get("name", "")
+        if not raw_name:
+            continue
+            
+        parsed = parse_filename(raw_name)
+        site = parsed.get("site", "")
+        title = parsed.get("title", "")
+        
+        cache_key = f"{site} - {title}"
+        if cache_key not in STASH_CACHE:
+            to_fetch.append((site, title))
+            
+    # Deduplicate matching site/title combos
+    to_fetch = list(set(to_fetch))
+    
+    if to_fetch:
+        print(f"🔄 StashDB: Found {len(to_fetch)} new videos to cache. Starting background fetch (this may take a while)...", flush=True)
+        # StashDB rate limits, so we add a delay
+        delay_seconds = 1.5
+        for i, (site, title) in enumerate(to_fetch, 1):
+            if DEBUG_MODE:
+                print(f"🛠️ [DEBUG] Background Fetch [{i}/{len(to_fetch)}]: {site} - {title}", flush=True)
+            query_stashdb(site, title)
+            # Sleep unless it's the very last item
+            if i < len(to_fetch):
+                time.sleep(delay_seconds)
+                
+        print("✅ StashDB: Background cache filling complete!", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -892,12 +996,13 @@ def heresphere_video(idx: int):
     title = parsed["title"]
     site = parsed["site"]
     
-    # --- Commented out local tag parsing logic ---
-    # hs_tags = [{"name": t} for t in parsed["tags"]]
-    
-    # Instead, query StashDB using the parsed site and title
+    # Attempt to fetch StashDB tags from cache
+    # We no longer query StashDB synchronously here to avoid making the user wait.
+    # The background thread handles filling the cache.
+    cache_key = f"{site} - {title}"
+    stash_data = STASH_CACHE.get(cache_key)
+
     hs_tags = []
-    stash_data = query_stashdb(site, title)
     if stash_data:
         # Add performers as the first tags
         for performer in stash_data.get("performers", []):
@@ -911,8 +1016,11 @@ def heresphere_video(idx: int):
             if t_name:
                 hs_tags.append({"name": t_name, "start": 0, "end": 0})
     else:
-        # Fallback to local regex-parsed tags if StashDB fails
-        debug_print(f"Using local backup tags for: {title}")
+        # Fallback to local regex-parsed tags if StashDB data isn't cached yet (or failed)
+        if STASHDB_API_KEY:
+            debug_print(f"Using local backup tags for: {title} (StashDB cache miss/pending)")
+        else:
+            debug_print(f"Using local backup tags for: {title}")
         hs_tags = [{"name": t, "start": 0, "end": 0} for t in parsed["tags"]]
 
     # Duration from state (in ms); Stremio stores in ms already
@@ -977,6 +1085,138 @@ def refresh():
     return jsonify({"status": "ok", "count": len(library_items)})
 
 
+@app.route("/match", methods=["GET"])
+def match_ui():
+    """Web UI to manually match videos that StashDB missed."""
+    unmatched_items = []
+    
+    for item in library_items:
+        raw_name = item.get("name", "")
+        if not raw_name: continue
+        
+        parsed = parse_filename(raw_name)
+        site = parsed.get("site", "")
+        title = parsed.get("title", "")
+        
+        cache_key = f"{site} - {title}"
+        stash_data = STASH_CACHE.get(cache_key)
+        
+        # We only want items that have been cached explicitly as None (failed matches)
+        # or items not in cache at all (though background thread usually handles them)
+        if stash_data is None and cache_key in STASH_CACHE:
+            unmatched_items.append({
+                "cache_key": cache_key,
+                "raw_name": raw_name,
+                "parsed_title": title,
+                "parsed_site": site,
+                "poster": item.get("poster", "")
+            })
+            
+    html_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Manual StashDB Matching</title>
+        <style>
+            body { font-family: system-ui, sans-serif; background: #1a1a1a; color: #eee; max-width: 800px; margin: 0 auto; padding: 20px; }
+            .item { display: flex; gap: 20px; background: #2a2a2a; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+            .poster { width: 120px; border-radius: 4px; object-fit: cover; }
+            .info { flex: 1; }
+            h3 { margin: 0 0 10px 0; color: #4facfe; }
+            .raw-name { font-size: 0.9em; color: #aaa; margin-bottom: 15px; }
+            input[type="text"] { width: 100%; padding: 8px; margin-bottom: 10px; background: #333; color: white; border: 1px solid #444; border-radius: 4px; }
+            button { background: #4facfe; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
+            button:hover { background: #00f2fe; color: black; }
+            .success { color: #00f2fe; display: none; margin-top: 10px; }
+            .error { color: #fe4f4f; display: none; margin-top: 10px; }
+        </style>
+    </head>
+    <body>
+        <h2>Unmatched Videos ({{ items|length }})</h2>
+        <p>These videos yielded no results on StashDB automatically. Paste a StashDB Scene URL below to fix them.</p>
+        
+        {% for item in items %}
+        <div class="item" id="item-{{ loop.index }}">
+            <img src="{{ item.poster }}" class="poster" onerror="this.style.display='none'">
+            <div class="info">
+                <h3>{{ item.parsed_site }} - {{ item.parsed_title }}</h3>
+                <div class="raw-name">{{ item.raw_name }}</div>
+                <input type="text" id="url-{{ loop.index }}" placeholder="Paste StashDB Scene URL here (e.g. https://stashdb.org/scenes/xyz)">
+                <button onclick="submitMatch('{{ loop.index }}', '{{ item.cache_key|urlencode }}')">Save Match</button>
+                <div id="msg-{{ loop.index }}"></div>
+            </div>
+        </div>
+        {% endfor %}
+        
+        <script>
+            async function submitMatch(idx, cacheKey) {
+                const urlInput = document.getElementById('url-' + idx).value;
+                const msgDiv = document.getElementById('msg-' + idx);
+                msgDiv.innerHTML = "Saving...";
+                msgDiv.className = "";
+                msgDiv.style.display = "block";
+                msgDiv.style.color = "#aaa";
+                
+                try {
+                    const res = await fetch('/api/match', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ cache_key: decodeURIComponent(cacheKey), stashdb_url: urlInput })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        msgDiv.innerHTML = "✅ Matched: " + data.title;
+                        msgDiv.className = "success";
+                        msgDiv.style.display = "block";
+                    } else {
+                        msgDiv.innerHTML = "❌ Error: " + data.error;
+                        msgDiv.style.color = "#fe4f4f";
+                        msgDiv.style.display = "block";
+                    }
+                } catch(e) {
+                    msgDiv.innerHTML = "❌ Network Error";
+                    msgDiv.style.color = "#fe4f4f";
+                    msgDiv.style.display = "block";
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html_template, items=unmatched_items)
+
+@app.route("/api/match", methods=["POST"])
+def api_match():
+    req = request.json
+    if not req:
+        return jsonify({"success": False, "error": "Invalid request"})
+        
+    cache_key = req.get("cache_key")
+    stashdb_url = req.get("stashdb_url", "")
+    
+    # Extract ID from URL
+    match = re.search(r'stashdb\.org/scenes/([a-f0-9\-]+)', stashdb_url)
+    if not match:
+        return jsonify({"success": False, "error": "Invalid StashDB Scene URL"})
+        
+    scene_id = match.group(1)
+    
+    # Fetch from StashDB
+    scene_data = query_stashdb_by_id(scene_id)
+    if not scene_data:
+        return jsonify({"success": False, "error": "Could not fetch scene from StashDB"})
+        
+    # Save to Cache
+    STASH_CACHE[cache_key] = scene_data
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STASH_CACHE, f, indent=2)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Failed to save to disk: {e}"})
+        
+    return jsonify({"success": True, "title": scene_data.get("title")})
+
+
 @app.route("/", methods=["GET"])
 def root():
     """Simple status page."""
@@ -992,6 +1232,10 @@ def root():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     fetch_library()
+    
+    # Start background StashDB caching thread
+    threading.Thread(target=fill_stash_cache_background, daemon=True).start()
+    
     print(f"\n🚀 HereSphere bridge running on http://0.0.0.0:{PORT}/heresphere")
     print(f"   Point HereSphere to:  http://<YOUR_LAN_IP>:{PORT}/heresphere\n")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
