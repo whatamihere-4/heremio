@@ -542,7 +542,11 @@ def query_stashdb(site: str, clean_title: str):
         debug_print(f"Loaded {cache_key} from STASH_CACHE")
         return STASH_CACHE[cache_key]
 
-    debug_print(f"Querying StashDB for: '{cache_key}'")
+    # Use BOTH site and title in the text query to avoid broad mismatches
+    # e.g. "The Student" vs "DarkRoomVR The Student"
+    search_text = f"{site} {clean_title}" if site else clean_title
+
+    debug_print(f"Querying StashDB for: '{search_text}'")
     url = "https://stashdb.org/graphql"
     headers = {
         "Content-Type": "application/json",
@@ -563,10 +567,6 @@ def query_stashdb(site: str, clean_title: str):
     }
     """
     
-    # Use BOTH site and title in the text query to avoid broad mismatches
-    # e.g. "The Student" vs "DarkRoomVR The Student"
-    search_text = f"{site} {clean_title}" if site else clean_title
-
     payload = {
         "query": query,
         "variables": {
