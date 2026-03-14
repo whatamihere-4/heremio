@@ -89,6 +89,8 @@ def _parse_bracketed(filename: str) -> dict:
     # --- Extract site name(s) from leading bracket(s) ---
     site_match = re.match(r'^\[([^\]]+)\]', filename)
     site = site_match.group(1).strip() if site_match else ""
+    # Strip .com from the site name for better StashDB matching
+    site = re.sub(r'\.com$', '', site, flags=re.IGNORECASE)
 
     # Remove the leading [site] bracket to work with the rest
     rest = filename[site_match.end():].strip() if site_match else filename
@@ -242,6 +244,8 @@ def _parse_dash_separated(filename: str) -> dict:
     """
     parts = filename.split(" - ")
     site = parts[0].strip() if len(parts) >= 1 else ""
+    # Strip .com from the site name for better StashDB matching
+    site = re.sub(r'\.com$', '', site, flags=re.IGNORECASE)
     performers = []
     title = ""
 
@@ -906,6 +910,10 @@ def heresphere_video(idx: int):
             t_name = tag.get("name")
             if t_name:
                 hs_tags.append({"name": t_name, "start": 0, "end": 0})
+    else:
+        # Fallback to local regex-parsed tags if StashDB fails
+        debug_print(f"Using local backup tags for: {title}")
+        hs_tags = [{"name": t, "start": 0, "end": 0} for t in parsed["tags"]]
 
     # Duration from state (in ms); Stremio stores in ms already
     duration_ms = 0
