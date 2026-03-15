@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Stremio → HereSphere Bridge Server
 Serves your Stremio library over LAN to the HereSphere VR player app.
@@ -7,16 +8,18 @@ import os
 import re
 import json
 import base64
-import time
-import requests
-import urllib.request
-import urllib.parse
-import urllib.error
-import ssl
 import threading
-from flask import Flask, request, jsonify, make_response, render_template_string
+import requests
 from datetime import datetime
+from flask import Flask, request, jsonify, make_response, render_template_string
 from dotenv import load_dotenv
+
+from parse_filename import parse_filename
+from stashdb import (
+    STASH_CACHE, load_cache, save_cache,
+    query_stashdb, query_stashdb_by_id, fill_stash_cache_background,
+)
+from streams import resolve_streams, streams_to_media
 
 load_dotenv()
 
@@ -26,360 +29,10 @@ load_dotenv()
 STASHDB_API_KEY = os.environ.get("STASHDB_API_KEY", "")
 DEBUG_MODE      = os.environ.get("DEBUG_MODE", "True").lower() == "true"
 
-# ---------------------------------------------------------------------------
-# Filename Parsing Logic
-# ---------------------------------------------------------------------------
-def parse_filename(filename: str) -> dict:
-    """
-    Extract title and tags from a filename string.
 
-    Handles these common formats:
-      1. [Site] Performer (Title / date) [year, tag1, tag2, ...]
-      2. [Site] Performer - Title [date, tag1, tag2, ...]
-      3. SiteName YY MM DD Performer Title XXX ...
-      4. Site - Performer - Title resolution
-
-    Returns:
-        dict with keys:
-            "title"   : str   — the cleaned scene/video title
-            "tags"    : list  — list of individual tag strings
-            "site"    : str   — source site name (if found)
-            "performers" : list — performer names (best effort)
-    """
-    filename = filename.strip()
-    if not filename:
-        return {"title": "", "tags": [], "site": "", "performers": []}
-
-    # -------------------------------------------------------------------
-    # FORMAT 1 & 2:  Starts with [Site]
-    # -------------------------------------------------------------------
-    if filename.startswith("["):
-        return _parse_bracketed(filename)
-
-    # -------------------------------------------------------------------
-    # FORMAT 3:  Scene-release style  e.g.
-    #   DirtyWivesClub 24 01 17 Jessica Rex REMASTERED XXX VR180 ...
-    # -------------------------------------------------------------------
-    scene_match = re.match(
-        r'^([A-Za-z]+(?:[A-Z][a-z]+)*)\s+'       # SiteName (CamelCase)
-        r'(\d{2})\s+(\d{2})\s+(\d{2})\s+'        # YY MM DD
-        r'(.+?)\s+XXX\b',                         # everything until XXX
-        filename
-    )
-    if scene_match:
-        return _parse_scene_release(filename, scene_match)
-
-    # -------------------------------------------------------------------
-    # FORMAT 4:  Simple dash-separated
-    #   WankzVR - Abella Danger, Yhivi - Director's Cut - Threesomes, ...
-    #   VRPorn - Ember Snow, ... - The Pussycat Girls 1920p
-    #   SexLikeReal - Keaw - Hot Thai Bargirl Loves To Get Creampied 4096p
-    # -------------------------------------------------------------------
-    if " - " in filename:
-        return _parse_dash_separated(filename)
-
-    # Fallback: use the whole string as the title
-    return {"title": filename, "tags": [], "site": "", "performers": []}
-
-
-def _parse_bracketed(filename: str) -> dict:
-    """
-    Parse filenames that start with [Site] and contain bracket-delimited
-    metadata sections.
-    """
-    # --- Extract site name(s) from leading bracket(s) ---
-    site_match = re.match(r'^\[([^\]]+)\]', filename)
-    site = site_match.group(1).strip() if site_match else ""
-    # Strip .com from the site name for better StashDB matching
-    site = re.sub(r'\.com$', '', site, flags=re.IGNORECASE)
-
-    # Remove the leading [site] bracket to work with the rest
-    rest = filename[site_match.end():].strip() if site_match else filename
-
-    # --- Extract tag brackets (also match unclosed trailing brackets) ---
-    all_brackets = re.findall(r'\[([^\]]+)(?:\]|$)', rest)
-
-    tags = []
-    for bracket_content in all_brackets:
-        items = [item.strip() for item in bracket_content.split(",")]
-        for item in items:
-            cleaned = _clean_tag(item)
-            if cleaned:
-                tags.append(cleaned)
-
-    # --- Strip all square-bracket sections to get the "core text" ---
-    core = re.sub(r'\[[^\]]*\]', '', rest).strip()
-
-    # --- Handle || separators (NaughtyAmerica pattern) ---
-    # e.g. "Charlie Forde , Slimthick Vic || Sam Shock (description / ID)"
-    # Performers are BEFORE ||, title is in parens AFTER ||
-    if "||" in core:
-        before_pipe, after_pipe = core.split("||", 1)
-        performers = _extract_performers(before_pipe.strip())
-        # Find the title in parens from the after-|| portion
-        paren_match = re.search(r'\(([^)]*)\)', after_pipe)
-        if paren_match:
-            raw_title = paren_match.group(1).strip()
-            title = _clean_title_from_parens(raw_title)
-        else:
-            title = after_pipe.strip()
-        if not title:
-            title = ", ".join(performers) if performers else site
-        # Prepend performers as tags
-        tags = performers + tags
-        return {
-            "title": title.strip(),
-            "tags": tags,
-            "site": site,
-            "performers": performers,
-        }
-
-    # --- Extract title ---
-    title = ""
-    performers = []
-
-    # Try to find content in parentheses (the scene title)
-    paren_match = re.search(r'\(([^)]*)\)', core)
-    if paren_match:
-        raw_title = paren_match.group(1).strip()
-        title = _clean_title_from_parens(raw_title)
-        before_paren = core[:paren_match.start()].strip()
-
-        # When there's a " - " before the parens, the dash-separated
-        # part is always the real title (parens are supplementary info)
-        # e.g. "Performer - Hot Strip Club Sex 8K (AI Upscaled...)"
-        if " - " in before_paren:
-            parts = before_paren.split(" - ", 1)
-            performers = _extract_performers(parts[0])
-            title = parts[1].strip() or title
-        else:
-            # Check if paren-extracted title is just noise (numeric ID, etc.)
-            is_poor_title = (
-                not title
-                or re.match(r'^\d+$', title)
-                or title.lower() in ("remastered", "a xxx parody", "a porn parody",
-                                      "vr porn parody", "cgi")
-            )
-            if is_poor_title and before_paren:
-                # Use the full text before parens as title
-                title = before_paren
-            else:
-                performers = _extract_performers(before_paren)
-                if performers and title:
-                    # Mux NaughtyAmerica format (Performers - Series)
-                    title = f"{', '.join(performers)} - {title}"
-    else:
-        # No parentheses — find title from text before first tag bracket
-        first_bracket = re.search(r'\[', rest)
-        if first_bracket:
-            before_bracket = rest[:first_bracket.start()].strip()
-        else:
-            before_bracket = rest.strip()
-
-        if " - " in before_bracket:
-            parts = before_bracket.split(" - ", 1)
-            performers = _extract_performers(parts[0])
-            title = parts[1].strip()
-        else:
-            title = before_bracket
-
-    # If title is empty but we have performers, build a fallback
-    if not title and performers:
-        title = ", ".join(performers)
-
-    # If we still have no title, use the site name
-    if not title:
-        title = site or filename[:80]
-
-    # Prepend performers as tags (HereSphere only supports tags)
-    tags = performers + tags
-
-    return {
-        "title": title.strip(),
-        "tags": tags,
-        "site": site,
-        "performers": performers,
-    }
-
-
-def _parse_scene_release(filename: str, match: re.Match) -> dict:
-    """
-    Parse scene-release style filenames like:
-    DirtyWivesClub 24 01 17 Jessica Rex REMASTERED XXX VR180 3072p MP4-VACCiNE [XC]
-    """
-    site_raw = match.group(1)
-    # Split CamelCase into words for the site name
-    site = re.sub(r'([a-z])([A-Z])', r'\1 \2', site_raw)
-
-    performer_and_title = match.group(5).strip()
-
-    # Common keywords that signal end of performer/title info
-    # Remove REMASTERED and similar suffixes
-    clean_name = re.sub(r'\b(REMASTERED|Remastered)\b', '', performer_and_title).strip()
-
-    # The rest after XXX contains tags/format info
-    after_xxx = filename[match.end():]
-    tags = []
-    # Extract resolution, format tags
-    tag_tokens = re.findall(r'(VR\d*|VR180|\d{3,4}p|MP4|SideBySide|[A-Z]{2,})', after_xxx)
-    for t in tag_tokens:
-        if t not in ("XXX", "MP4"):
-            tags.append(t)
-
-    # Also check for bracket content at the end
-    bracket_tags = re.findall(r'\[([^\]]+)\]', after_xxx)
-    for bt in bracket_tags:
-        cleaned = bt.strip()
-        if cleaned and cleaned not in tags:
-            tags.append(cleaned)
-
-    return {
-        "title": clean_name,
-        "tags": tags,
-        "site": site,
-        "performers": [],  # hard to separate performer from title in this format
-    }
-
-
-def _parse_dash_separated(filename: str) -> dict:
-    """
-    Parse dash-separated filenames like:
-    WankzVR - Abella Danger, Yhivi - Director's Cut - Threesomes, Remastered 3456p
-    """
-    parts = filename.split(" - ")
-    site = parts[0].strip() if len(parts) >= 1 else ""
-    # Strip .com from the site name for better StashDB matching
-    site = re.sub(r'\.com$', '', site, flags=re.IGNORECASE)
-    performers = []
-    title = ""
-
-    if len(parts) >= 3:
-        # Site - Performer(s) - Title [- extra]
-        performers = _extract_performers(parts[1])
-        # Rejoin remaining parts as title (may have dashes in it)
-        title_raw = " - ".join(parts[2:])
-        # Remove trailing resolution like "1920p" or "4096p"
-        title = re.sub(r'\s+\d{3,4}p\s*$', '', title_raw).strip()
-    elif len(parts) == 2:
-        # Could be "Site - Title" or "Performer - Title"
-        title = re.sub(r'\s+\d{3,4}p\s*$', '', parts[1]).strip()
-
-    # Extract tags from comma-separated items in the last part
-    tags = []
-    last_part = parts[-1] if parts else ""
-    if "," in last_part:
-        items = [i.strip() for i in last_part.split(",")]
-        for item in items:
-            cleaned = _clean_tag(item)
-            if cleaned:
-                tags.append(cleaned)
-
-    # Prepend performers as tags
-    tags = performers + tags
-
-    return {
-        "title": title or filename,
-        "tags": tags,
-        "site": site,
-        "performers": performers,
-    }
-
-
-def _clean_title_from_parens(raw: str) -> str:
-    """
-    Clean a title extracted from parentheses.
-    Removes dates, IDs, and other noise while keeping the actual title.
-
-    Examples:
-      "Group Interview"                          → "Group Interview"
-      "Final Fantasy XXX Parody / 20.01.2014 / 323591"  → "Final Fantasy XXX Parody"
-      "Capital sins: Wrath – Halloween Special"  → "Capital sins: Wrath – Halloween Special"
-      "After School / 27.06.2018"                → "After School"
-      "The Unfaithful Boyfriend / 20.09.2019"    → "The Unfaithful Boyfriend"
-    """
-    # Split on " / " to separate title from date/ID components
-    segments = [s.strip() for s in raw.split(" / ")]
-
-    # Also handle " | " as separator
-    if len(segments) == 1:
-        segments = [s.strip() for s in raw.split(" | ")]
-
-    # Keep segments that don't look like pure dates or numeric IDs
-    title_parts = []
-    for seg in segments:
-        # Skip if it's purely a date pattern (DD.MM.YYYY, YYYY-MM-DD, etc.)
-        if re.match(r'^\d{1,2}[./]\d{1,2}[./]\d{2,4}$', seg):
-            continue
-        # Skip if it's purely numeric (like an ID: 323591)
-        if re.match(r'^\d{4,}$', seg):
-            continue
-        # Skip pure year patterns
-        if re.match(r'^\d{4}\s*(г\.|year)?$', seg):
-            continue
-        title_parts.append(seg)
-
-    title = " / ".join(title_parts) if title_parts else raw
-
-    return title.strip()
-
-
-def _extract_performers(text: str) -> list:
-    """
-    Extract performer names from a text segment.
-    Handles comma-separated and & separated names.
-    """
-    text = text.strip()
-    if not text:
-        return []
-
-    # Remove common prefixes/noise
-    text = re.sub(r'\|\|.*$', '', text)  # Remove || narrator names
-    text = text.strip()
-
-    # Split on comma and/or &
-    names = re.split(r',\s*|\s+&\s+', text)
-
-    performers = []
-    for name in names:
-        name = name.strip()
-        # Skip if it looks like a tag or keyword rather than a name
-        if not name:
-            continue
-        if re.match(r'^\d+p$', name):
-            continue
-        if name.upper() in ("VR", "POV", "SBS", "4K", "8K", "XXX"):
-            continue
-        performers.append(name)
-
-    return performers
-
-
-def _clean_tag(raw: str) -> str:
-    """
-    Clean a single tag string. Returns empty string if the tag
-    should be skipped.
-    """
-    tag = raw.strip()
-    if not tag:
-        return ""
-
-    # Skip pure year entries like "2017 г." or "2022"
-    if re.match(r'^\d{4}\s*(г\.?)?$', tag):
-        return ""
-
-    # Skip date entries
-    if re.match(r'^\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}$', tag):
-        return ""
-
-    # Skip pure resolutions (we'll handle these separately if needed)
-    if re.match(r'^\d{3,4}p$', tag):
-        return ""
-
-    # Skip format/container markers
-    if tag.upper() in ("SITERIP", "SIDEBYIDE"):
-        return ""
-
-    return tag
+def debug_print(msg):
+    if DEBUG_MODE:
+        print(f"🛠️ [DEBUG] {msg}", flush=True)
 
 
 def get_auth_key():
@@ -394,10 +47,7 @@ def get_auth_key():
     print("Logging in to Stremio as {}...".format(email))
 
     url = "https://api.strem.io/api/login"
-    payload = {
-        "email": email,
-        "password": password
-    }
+    payload = {"email": email, "password": password}
 
     try:
         response = requests.post(url, json=payload)
@@ -421,7 +71,7 @@ def get_auth_key():
             print("Your STREMIO_AUTH key is:")
             print(auth_key)
             print("===============\n")
-        
+
         return auth_key
 
     except requests.exceptions.HTTPError as e:
@@ -438,13 +88,10 @@ def get_auth_key():
         print("An error occurred: {}".format(e))
         return None
 
+
 STREMIO_AUTH   = get_auth_key() or os.environ.get("STREMIO_AUTH", "")
 PTUBE_MANIFEST = os.environ.get("PTUBE_MANIFEST", "")
 RD_TOKEN       = os.environ.get("RD_TOKEN", "")
-
-def debug_print(msg):
-    if DEBUG_MODE:
-        print(f"🛠️ [DEBUG] {msg}", flush=True)
 
 # Derive the PTube addon base URLs from the manifest URL
 PTUBE_BASE = PTUBE_MANIFEST.rsplit("/manifest.json", 1)[0]
@@ -454,17 +101,17 @@ try:
     ptube_url_parts = PTUBE_BASE.split("/")
     ptube_config_b64 = ptube_url_parts[-1]
     ptube_host = "/".join(ptube_url_parts[:-1])
-    
+
     pad = len(ptube_config_b64) % 4
     b64_str = ptube_config_b64 + "=" * ((4 - pad) % 4)
     if "-" in b64_str or "_" in b64_str:
         config_json = base64.urlsafe_b64decode(b64_str).decode("utf-8")
     else:
         config_json = base64.b64decode(b64_str).decode("utf-8")
-        
+
     config = json.loads(config_json)
     config["hideTorrents"] = False
-    
+
     new_json_bytes = json.dumps(config).encode("utf-8")
     new_b64 = base64.urlsafe_b64encode(new_json_bytes).decode("utf-8").rstrip("=")
     PTUBE_FALLBACK_BASE = f"{ptube_host}/{new_b64}"
@@ -475,29 +122,19 @@ except Exception as e:
 STREMIO_API = "https://api.strem.io/api"
 PORT = 9000
 
-# ---------------------------------------------------------------------------
-# In-memory library & Cache stores
-# ---------------------------------------------------------------------------
-library_items = []   # list of dicts from Stremio
-item_by_idx = {}     # idx → item dict
+# Load StashDB cache from disk
+load_cache(debug_mode=DEBUG_MODE)
 
-CACHE_FILE = "cache.json"
-STASH_CACHE = {}     # Cache for StashDB queries {"Site - Title": stashdb_dict}
-STASH_PENDING = set() # Track keys currently being queried
 
-# Load existing cache from disk
-if os.path.exists(CACHE_FILE):
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            STASH_CACHE = json.load(f)
-        if DEBUG_MODE:
-            print(f"Loaded {len(STASH_CACHE)} entries from {CACHE_FILE}")
-    except Exception as e:
-        print(f"Error loading {CACHE_FILE}: {e}")
+# ---------------------------------------------------------------------------
+# Stremio library
+# ---------------------------------------------------------------------------
+library_items = []
+item_by_idx = {}
 
 
 def fetch_library():
-    """Pull the full Stremio library (same logic as getlibrary.py)."""
+    """Pull the full Stremio library."""
     global library_items, item_by_idx
 
     print("📡 Fetching library item IDs from Stremio...")
@@ -519,7 +156,6 @@ def fetch_library():
     data.raise_for_status()
 
     items = data.json().get("result", [])
-    # Keep only non-removed movies
     movies = [it for it in items if isinstance(it, dict)
               and it.get("type") == "movie" and not it.get("removed")]
 
@@ -528,427 +164,9 @@ def fetch_library():
     print(f"✅ Library loaded: {len(movies)} movies")
 
 
-
-
 # ---------------------------------------------------------------------------
-# StashDB Integration
+# Helpers
 # ---------------------------------------------------------------------------
-def query_stashdb(site: str, clean_title: str):
-    """
-    Search StashDB using a basic text query and return structured HereSphere metadata if found.
-    Uses in-memory STASH_CACHE to prevent repeated API calls.
-    Returns None if no match or if API request fails.
-    """
-    if not STASHDB_API_KEY:
-        return None
-        
-    cache_key = f"{site} - {clean_title}"
-    if cache_key in STASH_CACHE:
-        debug_print(f"Loaded {cache_key} from STASH_CACHE")
-        return STASH_CACHE[cache_key]
-        
-    if cache_key in STASH_PENDING:
-        return None
-        
-    STASH_PENDING.add(cache_key)
-
-    # Use BOTH site and title in the text query to avoid broad mismatches
-    # e.g. "The Student" vs "DarkRoomVR The Student"
-    search_text = f"{site} {clean_title}" if site else clean_title
-
-    debug_print(f"Querying StashDB for: '{search_text}'")
-    url = "https://stashdb.org/graphql"
-    headers = {
-        "Content-Type": "application/json",
-        "ApiKey": STASHDB_API_KEY
-    }
-
-    query = """
-    query SearchScenes($input: SceneQueryInput!) {
-      queryScenes(input: $input) {
-        scenes {
-          title
-          date
-          studio { name }
-          performers { performer { name } }
-          tags { name }
-        }
-      }
-    }
-    """
-    
-    payload = {
-        "query": query,
-        "variables": {
-            "input": {
-                "text": search_text
-            }
-        }
-    }
-
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=20)
-        if response.status_code == 200:
-            data = response.json()
-            scenes = data.get("data", {}).get("queryScenes", {}).get("scenes", [])
-            
-            # Fallback to just the title if site + title yielded zero results
-            if not scenes and site:
-                debug_print(f"❌ No results for '{search_text}'. Retrying with just title: '{clean_title}'")
-                payload["variables"]["input"]["text"] = clean_title
-                response_fb = requests.post(url, json=payload, headers=headers, timeout=20)
-                if response_fb.status_code == 200:
-                    data_fb = response_fb.json()
-                    scenes = data_fb.get("data", {}).get("queryScenes", {}).get("scenes", [])
-
-            if scenes:
-                # We could ideally filter scenes by exact studio match, but usually ranks the right one first
-                first_match = scenes[0]
-                STASH_CACHE[cache_key] = first_match
-                
-                # Save to disk
-                try:
-                    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                        json.dump(STASH_CACHE, f, indent=2)
-                except Exception as e:
-                    debug_print(f"Error saving to {CACHE_FILE}: {e}")
-                    
-                debug_print(f"✅ StashDB match found: {first_match.get('title')} (Studio: {first_match.get('studio', {}).get('name')})")
-                return first_match
-            else:
-                debug_print("❌ No StashDB results found.")
-                STASH_CACHE[cache_key] = None
-                # Save the "not found" state too so we don't spam StashDB
-                try:
-                    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                        json.dump(STASH_CACHE, f, indent=2)
-                except Exception as e:
-                    debug_print(f"Error saving to {CACHE_FILE}: {e}")
-        else:
-            debug_print(f"⚠️ StashDB HTTP Error {response.status_code}: {response.text}")
-    except requests.exceptions.Timeout:
-        debug_print(f"⚠️ StashDB Query Timeout for '{search_text}'. Will retry next session.")
-        # Do deliberately NOT cache `None` here, so the script can try again later!
-    except Exception as e:
-        debug_print(f"⚠️ StashDB Query Exception: {e}")
-    finally:
-        STASH_PENDING.discard(cache_key)
-        
-    return None
-
-def query_stashdb_by_id(scene_id: str):
-    """
-    Search StashDB using a specific Scene ID and return structured HereSphere metadata if found.
-    """
-    if not STASHDB_API_KEY:
-        return None
-
-    debug_print(f"Querying StashDB by ID: '{scene_id}'")
-    url = "https://stashdb.org/graphql"
-    headers = {
-        "Content-Type": "application/json",
-        "ApiKey": STASHDB_API_KEY
-    }
-
-    query = """
-    query FindScene($id: ID!) {
-      findScene(id: $id) {
-        title
-        date
-        studio { name }
-        performers { performer { name } }
-        tags { name }
-      }
-    }
-    """
-    
-    payload = {
-        "query": query,
-        "variables": {
-            "id": scene_id
-        }
-    }
-
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=20)
-        if response.status_code == 200:
-            data = response.json()
-            scene = data.get("data", {}).get("findScene")
-            if scene:
-                debug_print(f"✅ StashDB match found by ID: {scene.get('title')}")
-                return scene
-            else:
-                debug_print("❌ No StashDB results found for ID.")
-        else:
-            debug_print(f"⚠️ StashDB HTTP Error {response.status_code}: {response.text}")
-    except Exception as e:
-        debug_print(f"⚠️ StashDB Query Exception: {e}")
-        
-    return None
-
-def fill_stash_cache_background():
-    """
-    Background worker that runs on startup.
-    Finds all movies in the library that don't have a StashDB cache entry yet,
-    and queries StashDB for them one by one with a rate limit.
-    """
-    if not STASHDB_API_KEY:
-        return
-        
-    to_fetch = []
-    
-    # Identify items missing from cache
-    for item in library_items:
-        raw_name = item.get("name", "")
-        if not raw_name:
-            continue
-            
-        parsed = parse_filename(raw_name)
-        site = parsed.get("site", "")
-        title = parsed.get("title", "")
-        
-        cache_key = f"{site} - {title}"
-        if cache_key not in STASH_CACHE:
-            to_fetch.append((site, title))
-            
-    # Deduplicate matching site/title combos
-    to_fetch = list(set(to_fetch))
-    
-    if to_fetch:
-        print(f"🔄 StashDB: Found {len(to_fetch)} new videos to cache. Starting background fetch (this may take a while)...", flush=True)
-        # StashDB rate limits, so we add a delay
-        delay_seconds = 1.5
-        for i, (site, title) in enumerate(to_fetch, 1):
-            if DEBUG_MODE:
-                print(f"🛠️ [DEBUG] Background Fetch [{i}/{len(to_fetch)}]: {site} - {title}", flush=True)
-            query_stashdb(site, title)
-            # Sleep unless it's the very last item
-            if i < len(to_fetch):
-                time.sleep(delay_seconds)
-                
-        print("✅ StashDB: Background cache filling complete!", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Stream Resolution & Real-Debrid API
-# ---------------------------------------------------------------------------
-def rd_api(method, endpoint, data=None):
-    url = f"https://api.real-debrid.com/rest/1.0{endpoint}"
-    headers = {"Authorization": f"Bearer {RD_TOKEN}"}
-    
-    data_encoded = None
-    if data:
-        data_encoded = urllib.parse.urlencode(data).encode("utf-8")
-        
-    req = urllib.request.Request(url, headers=headers, method=method, data=data_encoded)
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            if resp.status == 204:
-                return True
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        print(f"RD API Error on {endpoint}: {e} - {e.read().decode('utf-8')}")
-        return None
-    except Exception as e:
-        print(f"RD API Error on {endpoint}: {e}")
-        return None
-
-def resolve_infohash_rd(info_hash):
-    """Adds magnet to RD, selects files, waits for links, and unrestricts them."""
-    magnet = f"magnet:?xt=urn:btih:{info_hash}"
-    print(f"  🧲 Starting Real-Debrid resolution for infoHash: {info_hash}")
-    debug_print(f"Magnet link generated: {magnet}")
-    
-    debug_print("Calling RD API to add magnet...")
-    add_resp = rd_api("POST", "/torrents/addMagnet", {"magnet": magnet})
-    if not add_resp or "id" not in add_resp:
-        debug_print("Failed to add magnet to RD. Response missing 'id'.")
-        return []
-        
-    torrent_id = add_resp["id"]
-    debug_print(f"Successfully added magnet. RD Torrent ID: {torrent_id}")
-    
-    debug_print(f"Fetching torrent info for ID: {torrent_id}")
-    info = rd_api("GET", f"/torrents/info/{torrent_id}")
-    if not info:
-        debug_print("Failed to get torrent info from RD.")
-        return []
-        
-    files = info.get("files", [])
-    if files:
-        debug_print(f"Found {len(files)} files in torrent. Filtering > 50MB...")
-        # Select files larger than 50MB (likely VR video files)
-        file_ids = ",".join(str(f["id"]) for f in files if f["bytes"] > 50*1024*1024)
-        if not file_ids:
-            debug_print("No files > 50MB found. Selecting 'all' files.")
-            file_ids = "all"
-        else:
-            debug_print(f"Selected file IDs: {file_ids}")
-    else:
-        debug_print("No files metadata found in info. Selecting 'all'.")
-        file_ids = "all"
-        
-    print(f"  🧲 Instructing RD to select files: {file_ids}")
-    rd_api("POST", f"/torrents/selectFiles/{torrent_id}", {"files": file_ids})
-    
-    debug_print("Starting wait loop for links to be generated...")
-    # Wait for links to be generated
-    for attempt in range(15):
-        debug_print(f"Wait attempt {attempt+1}/15 for torrent ID {torrent_id}...")
-        info = rd_api("GET", f"/torrents/info/{torrent_id}")
-        if info and info.get("status") == "downloaded" and info.get("links"):
-            debug_print("Torrent is downloaded and links are available!")
-            break
-        print(f"  🧲 Waiting for RD download (status: {info.get('status') if info else 'unknown'})...")
-        time.sleep(1)
-        
-    if not info or not info.get("links"):
-        print("  🧲 RD failed to generate links in time, or torrent not cached.")
-        debug_print("Aborting RD resolution due to missing links.")
-        return []
-        
-    streams = []
-    debug_print(f"Found {len(info.get('links', []))} links. Proceeding to unrestrict...")
-    for link in info["links"]:
-        debug_print(f"Unrestricting link: {link}")
-        unrestrict = rd_api("POST", "/unrestrict/link", {"link": link})
-        if unrestrict and unrestrict.get("download"):
-            size_mb = unrestrict.get("filesize", 0) / (1024*1024)
-            filename = unrestrict.get("filename", "")
-            debug_print(f"Successfully unrestricted! Final direct URL: {unrestrict['download']}")
-            streams.append({
-                "url": unrestrict["download"],
-                "name": "Debrid",
-                "title": f"📂 {size_mb:.0f} MB  🖥️ RD Torrent\n{filename}"
-            })
-        else:
-            debug_print("Failed to unrestrict link.")
-            
-    print(f"  ✅ Unrestricted {len(streams)} links via RD")
-    return streams
-
-def get_ptube_streams(url):
-    print(f"  📡 Fetching PTube streams: {url}")
-    try:
-        ctx = ssl.create_default_context()
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-            data = json.loads(resp.read().decode())
-        streams = data.get("streams", [])
-        return streams
-    except Exception as e:
-        print(f"  ⚠️ PTube fetch failed: {e}")
-        return []
-
-def resolve_streams(stremio_id: str):
-    """
-    Ask the PTube addon for streams for a given Stremio content ID.
-    If no URLs are found but torrents are hidden, retry with torrents enabled
-    and manually resolve via Real-Debrid API.
-    """
-    url = f"{PTUBE_BASE}/stream/movie/{stremio_id}.json"
-    debug_print(f"Resolving streams for Stremio ID: {stremio_id}. Primary URL: {url}")
-    streams = get_ptube_streams(url)
-    
-    # 1. Prioritize HTTP streams
-    http_streams = [s for s in streams if "url" in s or "externalUrl" in s]
-    if http_streams:
-        print(f"  ✅ Got {len(http_streams)} direct HTTP streams from PTube")
-        debug_print(f"HTTP streams found: {http_streams}")
-        return http_streams
-
-    tried_hashes = set()
-        
-    # 2. Check if we already have torrent infoHashes without fallback
-    torrent_streams = [s for s in streams if "infoHash" in s]
-    if torrent_streams:
-        print("  ⚠️ No direct URLs found, but torrents are present. Resolving via Real-Debrid...")
-        debug_print(f"Found {len(torrent_streams)} torrent streams.")
-        for s in torrent_streams:
-            h = s["infoHash"].lower()
-            if h in tried_hashes:
-                continue
-            tried_hashes.add(h)
-            debug_print(f"Trying infoHash: {h}")
-            rd_streams = resolve_infohash_rd(h)
-            if rd_streams:
-                debug_print("Successfully resolved RD streams from primary torrents.")
-                return rd_streams
-                
-    # 3. No usable streams found, try fallback manifest
-    if PTUBE_FALLBACK_BASE != PTUBE_BASE:
-        fallback_url = f"{PTUBE_FALLBACK_BASE}/stream/movie/{stremio_id}.json"
-        print("  ⚠️ No direct URLs or torrents found, trying fallback with torrents enabled...")
-        debug_print(f"Fetching fallback URL: {fallback_url}")
-        fallback_streams = get_ptube_streams(fallback_url)
-        for s in fallback_streams:
-            if "infoHash" in s:
-                h = s["infoHash"].lower()
-                if h in tried_hashes:
-                    continue
-                tried_hashes.add(h)
-                debug_print(f"Fallback torrent found. Trying infoHash: {h}")
-                rd_streams = resolve_infohash_rd(h)
-                if rd_streams:
-                    debug_print("Successfully resolved RD streams from fallback torrents.")
-                    return rd_streams
-                    
-    print(f"  ❌ No usable streams found for {stremio_id}")
-    debug_print("Exhausted all stream resolution methods.")
-    return []
-
-
-def streams_to_media(streams: list):
-    """Convert stream list into HereSphere media format."""
-    media = []
-    for s in streams:
-        # Each stream usually has a "url" (direct link) or "externalUrl"
-        stream_url = s.get("url") or s.get("externalUrl")
-        if not stream_url:
-            continue
-
-        # Try to parse resolution from the stream name/title
-        name = s.get("name", "") or ""
-        title = s.get("title", "") or ""
-        description = s.get("description", "") or ""
-        display_name = title or name or "Stream"
-
-        # Attempt to extract resolution (e.g. "1080p", "4K", "2160p")
-        res_match = re.search(r'(\d{3,4})p', f"{name} {title} {description}", re.IGNORECASE)
-        height = int(res_match.group(1)) if res_match else 0
-        if not height and re.search(r'4k|uhd', f"{name} {title}", re.IGNORECASE):
-            height = 2160
-        if not height and re.search(r'full\s*hd', f"{name} {title}", re.IGNORECASE):
-            height = 1080
-        if not height and re.search(r'\bHD\b', f"{name} {title}"):
-            height = 720
-        if not height:
-            height = 1080  # fallback
-
-        width = int(height * (16/9))
-
-        # Guess file size from description if available
-        size_match = re.search(r'([\d.]+)\s*(GB|MB)', f"{name} {title} {description}", re.IGNORECASE)
-        size_bytes = 0
-        if size_match:
-            val = float(size_match.group(1))
-            unit = size_match.group(2).upper()
-            size_bytes = int(val * (1073741824 if unit == "GB" else 1048576))
-
-        media.append({
-            "name": display_name[:80],
-            "sources": [{
-                "resolution": height,
-                "height": height,
-                "width": width,
-                "size": size_bytes,
-                "url": stream_url
-            }]
-        })
-    return media
-
-
 def parse_date(iso_str: str) -> str:
     """Convert ISO timestamp to YYYY-MM-DD."""
     if not iso_str:
@@ -958,6 +176,27 @@ def parse_date(iso_str: str) -> str:
         return dt.strftime("%Y-%m-%d")
     except Exception:
         return "2000-01-01"
+
+
+def _resolve(stremio_id):
+    """Wrapper that passes config into streams.resolve_streams."""
+    return resolve_streams(
+        stremio_id,
+        ptube_base=PTUBE_BASE,
+        ptube_fallback_base=PTUBE_FALLBACK_BASE,
+        rd_token=RD_TOKEN,
+        debug_print=debug_print,
+    )
+
+
+def _query_stashdb(site, title):
+    """Wrapper that passes config into stashdb.query_stashdb."""
+    return query_stashdb(site, title, api_key=STASHDB_API_KEY, debug_print=debug_print)
+
+
+def _query_stashdb_by_id(scene_id):
+    """Wrapper that passes config into stashdb.query_stashdb_by_id."""
+    return query_stashdb_by_id(scene_id, api_key=STASHDB_API_KEY, debug_print=debug_print)
 
 
 # ---------------------------------------------------------------------------
@@ -1003,47 +242,36 @@ def heresphere_video(idx: int):
     date_added = parse_date(item.get("_ctime", ""))
     stremio_id = item.get("_id", "")
 
-    # Parse filename to extract clean title and tags
     parsed = parse_filename(raw_name)
     title = parsed["title"]
     site = parsed["site"]
-    
-    # Attempt to fetch StashDB tags from cache
-    # We no longer query StashDB synchronously here to avoid making the user wait.
-    # The background thread handles filling the cache.
+
+    # Read tags from StashDB cache (background thread fills this)
     cache_key = f"{site} - {title}"
     stash_data = STASH_CACHE.get(cache_key)
 
     hs_tags = []
     if stash_data:
-        # Add performers as the first tags
         for performer in stash_data.get("performers", []):
             p_name = performer.get("performer", {}).get("name")
             if p_name:
                 hs_tags.append({"name": p_name, "start": 0, "end": 0})
-                
-        # Add the rest of the tags
         for tag in stash_data.get("tags", []):
             t_name = tag.get("name")
             if t_name:
                 hs_tags.append({"name": t_name, "start": 0, "end": 0})
     else:
-        # Fallback to local regex-parsed tags if StashDB data isn't cached yet (or failed)
         if STASHDB_API_KEY:
             debug_print(f"Using local backup tags for: {title} (StashDB cache miss/pending)")
         else:
             debug_print(f"Using local backup tags for: {title}")
         hs_tags = [{"name": t, "start": 0, "end": 0} for t in parsed["tags"]]
 
-    # Duration from state (in ms); Stremio stores in ms already
     duration_ms = 0
     state = item.get("state", {})
     if state.get("duration"):
         duration_ms = state["duration"]
 
-    # Check if HereSphere wants media sources (user clicked play)
-    # GET requests = library scan (no media needed)
-    # POST requests = check needsMediaSource field (default True per spec)
     needs_media = False
     if request.method == "POST":
         try:
@@ -1052,7 +280,6 @@ def heresphere_video(idx: int):
         except Exception:
             needs_media = True
 
-    # Build base response
     resp = {
         "access": 1,
         "title": title,
@@ -1074,7 +301,6 @@ def heresphere_video(idx: int):
         "writeHSP": False
     }
 
-    # If the raw name hints at VR content, set appropriate projection defaults
     name_lower = raw_name.lower()
     if any(kw in name_lower for kw in ["vr", "180", "360", "oculus", "vive", "quest"]):
         resp["projection"] = "equirectangular"
@@ -1082,10 +308,9 @@ def heresphere_video(idx: int):
     if "360" in name_lower:
         resp["projection"] = "equirectangular360"
 
-    # Resolve streams only when media is actually needed
     if needs_media:
-        streams = resolve_streams(stremio_id)
-        resp["media"] = streams_to_media(streams)
+        raw_streams = _resolve(stremio_id)
+        resp["media"] = streams_to_media(raw_streams)
 
     return hs_response(resp)
 
@@ -1097,136 +322,259 @@ def refresh():
     return jsonify({"status": "ok", "count": len(library_items)})
 
 
-@app.route("/match", methods=["GET"])
-def match_ui():
-    """Web UI to manually match videos that StashDB missed."""
-    unmatched_items = []
-    
-    for item in library_items:
+# ---------------------------------------------------------------------------
+# /api/match endpoint (used by both /match and /library UIs)
+# ---------------------------------------------------------------------------
+@app.route("/api/match", methods=["POST"])
+def api_match():
+    req = request.json
+    if not req:
+        return jsonify({"success": False, "error": "Invalid request"})
+
+    cache_key = req.get("cache_key")
+    stashdb_url = req.get("stashdb_url", "")
+
+    match = re.search(r'stashdb\.org/scenes/([a-f0-9\-]+)', stashdb_url)
+    if not match:
+        return jsonify({"success": False, "error": "Invalid StashDB Scene URL"})
+
+    scene_id = match.group(1)
+    scene_data = _query_stashdb_by_id(scene_id)
+    if not scene_data:
+        return jsonify({"success": False, "error": "Could not fetch scene from StashDB"})
+
+    STASH_CACHE[cache_key] = scene_data
+    save_cache()
+
+    return jsonify({"success": True, "title": scene_data.get("title")})
+
+
+# ---------------------------------------------------------------------------
+# /library — full library browser with integrated matching
+# ---------------------------------------------------------------------------
+@app.route("/library", methods=["GET"])
+def library_ui():
+    """Web UI to browse video library with StashDB data."""
+    all_items = []
+
+    for i, item in enumerate(library_items):
         raw_name = item.get("name", "")
-        if not raw_name: continue
-        
+        if not raw_name:
+            continue
         parsed = parse_filename(raw_name)
         site = parsed.get("site", "")
         title = parsed.get("title", "")
-        
         cache_key = f"{site} - {title}"
-        stash_data = STASH_CACHE.get(cache_key)
-        
-        # We only want items that have been cached explicitly as None (failed matches)
-        # or items not in cache at all (though background thread usually handles them)
-        if stash_data is None and cache_key in STASH_CACHE:
-            unmatched_items.append({
-                "cache_key": cache_key,
-                "raw_name": raw_name,
-                "parsed_title": title,
-                "parsed_site": site,
-                "poster": item.get("poster", "")
-            })
-            
-    html_template = """
+        stash = STASH_CACHE.get(cache_key)
+
+        performers = []
+        tags = []
+        stash_title = ""
+        stash_studio = ""
+        stash_date = ""
+        status = "pending"
+
+        if cache_key in STASH_CACHE:
+            if stash is None:
+                status = "unmatched"
+            else:
+                status = "matched"
+                stash_title = stash.get("title", "")
+                stash_studio = (stash.get("studio") or {}).get("name", "")
+                stash_date = stash.get("date", "")
+                performers = [p.get("performer", {}).get("name", "") for p in stash.get("performers", [])]
+                tags = [t.get("name", "") for t in stash.get("tags", [])]
+
+        all_items.append({
+            "idx": i,
+            "raw_name": raw_name,
+            "parsed_title": title,
+            "parsed_site": site,
+            "poster": item.get("poster", ""),
+            "cache_key": cache_key,
+            "status": status,
+            "stash_title": stash_title,
+            "stash_studio": stash_studio,
+            "stash_date": stash_date,
+            "performers": performers,
+            "tags": tags,
+        })
+
+    html = """
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <title>Manual StashDB Matching</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Library Browser</title>
         <style>
-            body { font-family: system-ui, sans-serif; background: #1a1a1a; color: #eee; max-width: 800px; margin: 0 auto; padding: 20px; }
-            .item { display: flex; gap: 20px; background: #2a2a2a; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
-            .poster { width: 120px; border-radius: 4px; object-fit: cover; }
-            .info { flex: 1; }
-            h3 { margin: 0 0 10px 0; color: #4facfe; }
-            .raw-name { font-size: 0.9em; color: #aaa; margin-bottom: 15px; }
-            input[type="text"] { width: 100%; padding: 8px; margin-bottom: 10px; background: #333; color: white; border: 1px solid #444; border-radius: 4px; }
-            button { background: #4facfe; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
-            button:hover { background: #00f2fe; color: black; }
-            .success { color: #00f2fe; display: none; margin-top: 10px; }
-            .error { color: #fe4f4f; display: none; margin-top: 10px; }
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; }
+            .header { padding: 20px 24px; background: #1a1a2e; border-bottom: 1px solid #222; display: flex; align-items: center; justify-content: space-between; }
+            .header h1 { font-size: 1.4em; color: #4facfe; }
+            .header .stats { font-size: 0.9em; color: #888; }
+            .filter-bar { padding: 12px 24px; background: #141420; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+            .filter-bar input[type=text] { flex: 1; min-width: 200px; padding: 8px 12px; background: #222; color: #fff; border: 1px solid #333; border-radius: 6px; font-size: 0.9em; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; padding: 20px 24px; }
+            .card { background: #1a1a2e; border-radius: 10px; overflow: hidden; cursor: pointer; transition: transform .15s, box-shadow .15s; position: relative; }
+            .card:hover { transform: translateY(-3px); box-shadow: 0 8px 24px rgba(79,172,254,.15); }
+            .card img { width: 100%; aspect-ratio: 2/3; object-fit: cover; display: block; background: #222; }
+            .card .info { padding: 10px 12px; }
+            .card .info .title { font-size: 0.85em; font-weight: 600; color: #fff; margin-bottom: 4px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+            .card .info .site { font-size: 0.75em; color: #4facfe; }
+            .card .badge { position: absolute; top: 8px; right: 8px; font-size: 0.65em; padding: 3px 8px; border-radius: 20px; font-weight: 600; text-transform: uppercase; }
+            .badge.matched { background: #0a3d0a; color: #4caf50; }
+            .badge.unmatched { background: #3d0a0a; color: #f44336; }
+            .badge.pending { background: #3d3d0a; color: #ff9800; }
+            .overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,.8); z-index: 100; justify-content: center; align-items: flex-start; padding: 40px 20px; overflow-y: auto; }
+            .overlay.active { display: flex; }
+            .modal { background: #1a1a2e; border-radius: 12px; max-width: 700px; width: 100%; overflow: hidden; }
+            .modal-header { display: flex; gap: 16px; padding: 20px; border-bottom: 1px solid #2a2a3e; }
+            .modal-header img { width: 140px; border-radius: 6px; object-fit: cover; }
+            .modal-header .meta { flex: 1; }
+            .modal-header .meta h2 { font-size: 1.1em; color: #4facfe; margin-bottom: 6px; }
+            .modal-header .meta .sub { font-size: 0.85em; color: #888; margin-bottom: 4px; }
+            .modal-body { padding: 16px 20px; }
+            .modal-body h3 { font-size: 0.9em; color: #999; margin: 12px 0 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+            .modal-body h3:first-child { margin-top: 0; }
+            .tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+            .tag { background: #2a2a3e; padding: 4px 10px; border-radius: 20px; font-size: 0.8em; color: #ccc; }
+            .tag.performer { background: #1a3a5c; color: #4facfe; }
+            .raw-name { font-size: 0.75em; color: #555; word-break: break-all; margin-top: 12px; padding-top: 12px; border-top: 1px solid #2a2a3e; }
+            .match-row { display: flex; gap: 8px; margin-top: 16px; padding-top: 12px; border-top: 1px solid #2a2a3e; }
+            .match-row input { flex: 1; padding: 8px 10px; background: #222; color: #fff; border: 1px solid #333; border-radius: 6px; font-size: 0.85em; }
+            .match-row button { padding: 8px 16px; background: #4facfe; color: #000; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85em; white-space: nowrap; }
+            .match-row button:hover { background: #00f2fe; }
+            .match-msg { font-size: 0.85em; margin-top: 8px; }
+            .close-btn { position: absolute; top: 12px; right: 16px; background: none; border: none; color: #888; font-size: 1.6em; cursor: pointer; z-index: 10; }
+            .close-btn:hover { color: #fff; }
+            .hidden { display: none !important; }
         </style>
     </head>
     <body>
-        <h2>Unmatched Videos ({{ items|length }})</h2>
-        <p>These videos yielded no results on StashDB automatically. Paste a StashDB Scene URL below to fix them.</p>
-        
-        {% for item in items %}
-        <div class="item" id="item-{{ loop.index }}">
-            <img src="{{ item.poster }}" class="poster" onerror="this.style.display='none'">
-            <div class="info">
-                <h3>{{ item.parsed_site }} - {{ item.parsed_title }}</h3>
-                <div class="raw-name">{{ item.raw_name }}</div>
-                <input type="text" id="url-{{ loop.index }}" placeholder="Paste StashDB Scene URL here (e.g. https://stashdb.org/scenes/xyz)">
-                <button onclick="submitMatch('{{ loop.index }}', '{{ item.cache_key|urlencode }}')">Save Match</button>
-                <div id="msg-{{ loop.index }}"></div>
-            </div>
+        <div class="header">
+            <h1>📚 Library Browser</h1>
+            <div class="stats" id="stats">{{ items|length }} videos</div>
         </div>
-        {% endfor %}
-        
+        <div class="filter-bar">
+            <input type="text" id="search" placeholder="Search titles, performers, sites..." oninput="filterCards()">
+            <label style="display:flex;align-items:center;gap:6px;color:#ccc;font-size:0.9em;cursor:pointer;white-space:nowrap;">
+                <input type="checkbox" id="unmatchedOnly" onchange="filterCards()" style="accent-color:#4facfe;"> Unmatched only
+            </label>
+        </div>
+        <div class="grid" id="grid">
+            {% for v in items %}
+            <div class="card" data-idx="{{ v.idx }}" data-status="{{ v.status }}" data-search="{{ v.parsed_site }} {{ v.parsed_title }} {{ v.performers|join(' ') }}" onclick="openModal({{ v.idx }})">
+                <img src="{{ v.poster }}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22300%22><rect fill=%22%23222%22 width=%22200%22 height=%22300%22/><text x=%2250%25%22 y=%2250%25%22 fill=%22%23555%22 font-size=%2214%22 text-anchor=%22middle%22 dy=%22.3em%22>No Image</text></svg>'">
+                <span class="badge {{ v.status }}">{{ v.status }}</span>
+                <div class="info">
+                    <div class="title">{{ v.parsed_title }}</div>
+                    <div class="site">{{ v.parsed_site }}</div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="overlay" id="overlay" onclick="if(event.target===this)closeModal()">
+            <div class="modal" style="position:relative" id="modal"></div>
+        </div>
+
         <script>
-            async function submitMatch(idx, cacheKey) {
-                const urlInput = document.getElementById('url-' + idx).value;
-                const msgDiv = document.getElementById('msg-' + idx);
-                msgDiv.innerHTML = "Saving...";
-                msgDiv.className = "";
-                msgDiv.style.display = "block";
-                msgDiv.style.color = "#aaa";
-                
+            const items = {{ items_json|safe }};
+
+            function filterCards() {
+                const q = document.getElementById('search').value.toLowerCase();
+                const unmatchedOnly = document.getElementById('unmatchedOnly').checked;
+                let visibleCount = 0;
+                document.querySelectorAll('.card').forEach(c => {
+                    const matchQ = !q || c.dataset.search.toLowerCase().includes(q);
+                    const matchS = !unmatchedOnly || c.dataset.status !== 'matched';
+                    const isVisible = matchQ && matchS;
+                    c.classList.toggle('hidden', !isVisible);
+                    if (isVisible) visibleCount++;
+                });
+                document.getElementById('stats').textContent = visibleCount + ' videos';
+            }
+
+            function openModal(idx) {
+                const v = items.find(i => i.idx === idx);
+                if (!v) return;
+                const perfHtml = v.performers.length ? v.performers.map(p => `<span class="tag performer">${p}</span>`).join('') : '<span style="color:#555">None</span>';
+                const tagsHtml = v.tags.length ? v.tags.map(t => `<span class="tag">${t}</span>`).join('') : '<span style="color:#555">None</span>';
+                const stashInfo = v.status === 'matched'
+                    ? `<div class="sub"><strong>StashDB:</strong> ${v.stash_title}</div>
+                       <div class="sub"><strong>Studio:</strong> ${v.stash_studio || '—'}</div>
+                       <div class="sub"><strong>Date:</strong> ${v.stash_date || '—'}</div>`
+                    : `<div class="sub" style="color:${v.status==='unmatched'?'#f44336':'#ff9800'}">
+                         ${v.status==='unmatched' ? '❌ No StashDB match' : '⏳ Pending lookup'}
+                       </div>`;
+
+                document.getElementById('modal').innerHTML = `
+                    <button class="close-btn" onclick="closeModal()">&times;</button>
+                    <div class="modal-header">
+                        <img src="${v.poster}" onerror="this.style.display='none'">
+                        <div class="meta">
+                            <h2>${v.parsed_title}</h2>
+                            <div class="sub" style="color:#4facfe">${v.parsed_site}</div>
+                            ${stashInfo}
+                        </div>
+                    </div>
+                    <div class="modal-body">
+                        <h3>Performers</h3>
+                        <div class="tag-list">${perfHtml}</div>
+                        <h3>Tags</h3>
+                        <div class="tag-list">${tagsHtml}</div>
+                        <div class="match-row">
+                            <input type="text" id="matchUrl-${idx}" placeholder="Paste StashDB scene URL to re-match...">
+                            <button onclick="doMatch(${idx})">Match</button>
+                        </div>
+                        <div class="match-msg" id="matchMsg-${idx}"></div>
+                        <div class="raw-name">${v.raw_name}</div>
+                    </div>`;
+                document.getElementById('overlay').classList.add('active');
+            }
+
+            function closeModal() {
+                document.getElementById('overlay').classList.remove('active');
+            }
+            document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+            async function doMatch(idx) {
+                const v = items.find(i => i.idx === idx);
+                const url = document.getElementById('matchUrl-' + idx).value;
+                const msg = document.getElementById('matchMsg-' + idx);
+                if (!url) { msg.innerHTML = '❌ Paste a URL first'; msg.style.color = '#f44336'; return; }
+                msg.innerHTML = 'Saving...'; msg.style.color = '#aaa';
                 try {
                     const res = await fetch('/api/match', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ cache_key: decodeURIComponent(cacheKey), stashdb_url: urlInput })
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ cache_key: v.cache_key, stashdb_url: url })
                     });
                     const data = await res.json();
                     if (data.success) {
-                        msgDiv.innerHTML = "✅ Matched: " + data.title;
-                        msgDiv.className = "success";
-                        msgDiv.style.display = "block";
+                        msg.innerHTML = '✅ Matched: ' + data.title;
+                        msg.style.color = '#4caf50';
+                        const card = document.querySelector(`.card[data-idx="${idx}"]`);
+                        if (card) {
+                            card.querySelector('.badge').className = 'badge matched';
+                            card.querySelector('.badge').textContent = 'matched';
+                            card.dataset.status = 'matched';
+                        }
                     } else {
-                        msgDiv.innerHTML = "❌ Error: " + data.error;
-                        msgDiv.style.color = "#fe4f4f";
-                        msgDiv.style.display = "block";
+                        msg.innerHTML = '❌ ' + data.error;
+                        msg.style.color = '#f44336';
                     }
                 } catch(e) {
-                    msgDiv.innerHTML = "❌ Network Error";
-                    msgDiv.style.color = "#fe4f4f";
-                    msgDiv.style.display = "block";
+                    msg.innerHTML = '❌ Network error';
+                    msg.style.color = '#f44336';
                 }
             }
         </script>
     </body>
     </html>
     """
-    return render_template_string(html_template, items=unmatched_items)
-
-@app.route("/api/match", methods=["POST"])
-def api_match():
-    req = request.json
-    if not req:
-        return jsonify({"success": False, "error": "Invalid request"})
-        
-    cache_key = req.get("cache_key")
-    stashdb_url = req.get("stashdb_url", "")
-    
-    # Extract ID from URL
-    match = re.search(r'stashdb\.org/scenes/([a-f0-9\-]+)', stashdb_url)
-    if not match:
-        return jsonify({"success": False, "error": "Invalid StashDB Scene URL"})
-        
-    scene_id = match.group(1)
-    
-    # Fetch from StashDB
-    scene_data = query_stashdb_by_id(scene_id)
-    if not scene_data:
-        return jsonify({"success": False, "error": "Could not fetch scene from StashDB"})
-        
-    # Save to Cache
-    STASH_CACHE[cache_key] = scene_data
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(STASH_CACHE, f, indent=2)
-    except Exception as e:
-        return jsonify({"success": False, "error": f"Failed to save to disk: {e}"})
-        
-    return jsonify({"success": True, "title": scene_data.get("title")})
+    return render_template_string(html, items=all_items, items_json=json.dumps(all_items))
 
 
 @app.route("/", methods=["GET"])
@@ -1244,10 +592,15 @@ def root():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     fetch_library()
-    
+
     # Start background StashDB caching thread
-    threading.Thread(target=fill_stash_cache_background, daemon=True).start()
-    
+    threading.Thread(
+        target=fill_stash_cache_background,
+        args=(library_items, parse_filename),
+        kwargs={"api_key": STASHDB_API_KEY, "debug_mode": DEBUG_MODE, "debug_print": debug_print},
+        daemon=True,
+    ).start()
+
     print(f"\n🚀 HereSphere bridge running on http://0.0.0.0:{PORT}/heresphere")
     print(f"   Point HereSphere to:  http://<YOUR_LAN_IP>:{PORT}/heresphere\n")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
