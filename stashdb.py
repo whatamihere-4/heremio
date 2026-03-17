@@ -152,63 +152,116 @@ def query_stashdb(sites, clean_title: str, parsed_performers=None, parsed_dates=
         def find_best_candidate(candidate_scenes, fallback_label=""):
             if not candidate_scenes: return None
             
-            # Helper to check if ANY of our parsed studios match the StashDB result
             def any_studio_matches(s_dict):
                 return any(_studio_matches(st, s_dict) for st in sites)
 
-            # Pass 1: Date check (Super high priority)
+            def has_actor_overlap(s_dict):
+                if not parsed_performers: return False
+                stash_actors = []
+                for p in s_dict.get("performers", []):
+                    # Handle different StashDB GraphQL performer node structures safely
+                    name = p.get("name") or p.get("performer", {}).get("name") if isinstance(p, dict) else p if isinstance(p, str) else None
+                    if name: stash_actors.append(name.lower())
+                
+                if not stash_actors: return False
+                for pp in parsed_performers:
+                    pp_lower = pp.lower()
+                    for sa in stash_actors:
+                        if pp_lower in sa or sa in pp_lower:
+                            return True
+                return False
+
+            # Compilation Safety Check
+            is_compilation = "compil" in scene_name.lower() or "collection" in scene_name.lower() or len(parsed_performers or []) >= 5
+            if is_compilation:
+                for s in candidate_scenes:
+                    stash_date = s.get("date") or ""
+                    ratio = difflib.SequenceMatcher(None, s.get("title", "").lower(), scene_name.lower()).ratio()
+                    
+                    if parsed_dates and stash_date in parsed_dates and any_studio_matches(s):
+                        # Require a strong 70% match to avoid grabbing Vol. 2 instead of Vol. 1 on the same date!
+                        if ratio >= 0.70: 
+                            debug_print(f"✅ Compilation Exact Date+Studio match! {fallback_label}: {s.get('title')} [{stash_date}]")
+                            return s
+                    if ratio >= 0.95 and any_studio_matches(s):
+                        debug_print(f"✅ Compilation Exact Title+Studio match! {fallback_label}: {s.get('title')}")
+                        return s
+                        
+                # EXCEPTION: If a massive compilation query yields exactly 1 result, trust it!
+                if len(candidate_scenes) == 1:
+                    s = candidate_scenes[0]
+                    # Since titles for compilations without dashes become just the actor list, [Primary] and [Studio+Title] act like actor searches
+                    if fallback_label in ["[Primary]", "[Studio+Title]", "[Studio+Actors]", "[Actors Only]"]:
+                        if len(parsed_performers or []) >= 3 and has_actor_overlap(s):
+                            debug_print(f"✅ Compilation absolute trust for single Actor match! {fallback_label}: {s.get('title')}")
+                            return s
+                
+                if candidate_scenes:
+                    debug_print(f"❌ Compilation safety triggered for {fallback_label}. Rejecting loose matches.")
+                return None
+
+            # Pass 1: Date check (Super high priority - with safety nets!)
             if parsed_dates:
                 for s in candidate_scenes:
                     stash_date = s.get("date") or ""
                     if stash_date and stash_date in parsed_dates:
                         stash_title = s.get("title") or ""
-                        stash_studio = (s.get("studio") or {}).get("name", "")
-                        
                         ratio = difflib.SequenceMatcher(None, stash_title.lower(), scene_name.lower()).ratio()
-                        studio_ratio = difflib.SequenceMatcher(None, stash_studio.lower(), scene_name.lower()).ratio() if stash_studio else 0.0
                         
-                        # If date matches perfectly, require a tighter title/studio match to avoid false positives
-                        if ratio >= 0.65 or studio_ratio >= 0.85 or (any_studio_matches(s) and ratio >= 0.35):
-                            debug_print(f"✅ Exact Date match! {fallback_label} (Title: {ratio:.2f}, Studio: {studio_ratio:.2f}): {stash_title} [{stash_date}]")
+                        if any_studio_matches(s):
+                            # Safe trust: Either the title isn't complete garbage, OR we verified an actor matches
+                            if ratio >= 0.40 or has_actor_overlap(s) or not parsed_performers:
+                                debug_print(f"✅ Exact Date+Studio match! {fallback_label} (Confidence: {ratio:.2f}): {stash_title} [{stash_date}]")
+                                return s
+                            
+                        # If the studio doesn't match but the date does, require a moderate title match
+                        if ratio >= 0.65:
+                            debug_print(f"✅ Exact Date match! {fallback_label} (Confidence: {ratio:.2f}): {stash_title} [{stash_date}]")
                             return s
                             
             # Pass 2: Standard Title/Studio match
             for s in candidate_scenes:
                 stash_title = s.get("title") or ""
-                stash_studio = (s.get("studio") or {}).get("name", "")
-                
                 ratio = difflib.SequenceMatcher(None, stash_title.lower(), scene_name.lower()).ratio()
-                studio_ratio = difflib.SequenceMatcher(None, stash_studio.lower(), scene_name.lower()).ratio() if stash_studio else 0.0
                 
-                if ratio >= 0.85:
-                    debug_print(f"✅ Title match {fallback_label} ({ratio:.2f}): {stash_title}")
+                if any_studio_matches(s) and ratio >= 0.85:
+                    debug_print(f"✅ Title+Studio match {fallback_label} ({ratio:.2f}): {stash_title}")
                     return s
-                if len(candidate_scenes) == 1 and studio_ratio >= 0.85:
-                    debug_print(f"✅ Sub-studio match! {fallback_label} '{stash_studio}' ({studio_ratio:.2f})")
+                
+                if ratio >= 0.90:
+                    debug_print(f"✅ Pure Title match {fallback_label} ({ratio:.2f}): {stash_title}")
                     return s
                     
-            # Pass 3: Hyper-specific fallback trust
+            # Pass 3: Hyper-specific fallback trust (Requires exactly 1 result)
             if len(candidate_scenes) == 1:
                 s = candidate_scenes[0]
                 stash_title = s.get("title") or ""
                 ratio = difflib.SequenceMatcher(None, stash_title.lower(), scene_name.lower()).ratio()
 
-                if fallback_label in ["[Studio+Title]", "[Studio+Title+Actors]", "[Title+Date]", "[Studio+Date]"]:
-                    if ratio >= 0.55 or any_studio_matches(s):
-                        debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Ratio: {ratio:.2f})")
+                is_czech = "czech vr" in scene_name.lower()
+                if is_czech and fallback_label in ["[Primary]", "[Studio+Title]"] and any_studio_matches(s):
+                    debug_print(f"✅ Czech VR exception trusted: '{stash_title}'")
+                    return s
+
+                # ABSOLUTE TRUST: Highly specific combinations that blindly bypass title/studio checks
+                if fallback_label in ["[Actors Only]", "[Studio+Date+Actors]"]:
+                    debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Confidence: {ratio:.2f})")
+                    return s
+
+                # Trust highly specific Actor combinations if the studio matches OR the title is close
+                if fallback_label in ["[Studio+Actors]", "[Studio+First Actor]", "[Title+Actors]", "[Title+First Actor]"]:
+                    # STOP BLIND TRUST: Require at least a 0.40 title match even if the studio is right!
+                    if (any_studio_matches(s) and ratio >= 0.40) or ratio >= 0.60:
+                        debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Confidence: {ratio:.2f})")
                         return s
 
-                if fallback_label in ["[Studio+Actors]", "[Studio+First Actor]", "[Title+Actors]", "[Title+First Actor]"]:
-                    if any_studio_matches(s) or ratio >= 0.60:
-                        debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Ratio: {ratio:.2f})")
+                # Trust standard fallbacks if the title is reasonably close
+                if fallback_label in ["[Studio+Title]", "[Studio+Title+Actors]", "[Title+Date]", "[Studio+Date]"]:
+                    if ratio >= 0.60:
+                        debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Confidence: {ratio:.2f})")
                         return s
-                        
-                # Blindly trust extremely specific combinations if they yield exactly one result
-                if fallback_label in ["[Actors Only]", "[Studio+Date+Actors]"]:
-                    debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Ratio: {ratio:.2f})")
-                    return s
                 else:
-                    debug_print(f"❌ Single result found for {fallback_label} but failed sanity check (Title Ratio: {ratio:.2f})")
+                    debug_print(f"❌ Single result found for {fallback_label} but failed sanity check (Title Confidence: {ratio:.2f})")
                 
             return None
 
@@ -250,10 +303,11 @@ def query_stashdb(sites, clean_title: str, parsed_performers=None, parsed_dates=
 
         # 4.5 Studio + Date + Actors
         if not best_match and sites and parsed_dates and actor_names:
+            clean_actors = re.sub(r'[()\-:\[\],_!?~]+', ' ', actor_names)
             for site in sites:
+                clean_site = re.sub(r'[()\-:\[\],_!?~]+', ' ', site)
                 for date_str in parsed_dates:
-                    site_date_actor_term = f"{site} {date_str} {actor_names}".strip()
-                    site_date_actor_term = re.sub(r'[()\-:\[\],_!?~]+', ' ', site_date_actor_term)
+                    site_date_actor_term = f"{clean_site} {date_str} {clean_actors}".strip()
                     site_date_actor_term = " ".join(site_date_actor_term.split())
                     debug_print(f"🔄 Retrying with Studio + Date + Actors: '{site_date_actor_term}'")
                     best_match = find_best_candidate(perform_query(site_date_actor_term), "[Studio+Date+Actors]")
@@ -326,14 +380,13 @@ def query_stashdb(sites, clean_title: str, parsed_performers=None, parsed_dates=
         if best_match:
             STASH_CACHE[cache_key] = best_match
             save_cache()
-            debug_print(f"🎉 StashDB saved: {best_match.get('title')} (Studio: {best_match.get('studio', {}).get('name')})")
-            debug_print("")
+            debug_print(f"🎉 StashDB saved: {best_match.get('title')} (Studio: {best_match.get('studio', {}).get('name')})\n\n")
             return best_match
         else:
-            debug_print(f"❌ No suitable StashDB results found.")
+            debug_print(f"❌ No suitable StashDB results found.\n\n")
             STASH_CACHE[cache_key] = None
             save_cache()
-            debug_print("")
+            return None
 
     except requests.exceptions.Timeout:
         debug_print(f"⚠️ StashDB Query Timeout for '{search_text}'. Will retry next session.")

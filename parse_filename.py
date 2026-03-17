@@ -65,6 +65,11 @@ def parse_filename(filename: str) -> dict:
         res["studios"] = list(dict.fromkeys(normalized_studios))
         res["site"] = res["studios"][0] if res["studios"] else ""
         res["possible_dates"] = _extract_dates(filename)
+        
+        # Strip 3D / version 3D noise from titles
+        if res.get("title"):
+            res["title"] = re.sub(r'\b(?:version\s*3D|3D)\b', '', res["title"], flags=re.IGNORECASE).strip()
+            res["title"] = re.sub(r'\s{2,}', ' ', res["title"]).strip()
 
     return res
 
@@ -162,7 +167,12 @@ def _parse_bracketed(filename: str) -> dict:
             performers = _extract_performers(parts[0])
             title = parts[1].strip()
         else:
-            title = before_bracket
+            # If there's no dash but lots of commas, it's a list of performers, not a title!
+            if "," in before_bracket:
+                performers = _extract_performers(before_bracket)
+                title = ""
+            else:
+                title = before_bracket
 
     if not title and performers:
         title = ", ".join(performers)
