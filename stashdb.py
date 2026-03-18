@@ -209,13 +209,17 @@ def query_stashdb(sites, clean_title: str, parsed_performers=None, parsed_dates=
                         ratio = difflib.SequenceMatcher(None, stash_title.lower(), scene_name.lower()).ratio()
                         
                         if any_studio_matches(s):
-                            # Safe trust: Either the title isn't complete garbage, OR we verified an actor matches
-                            if ratio >= 0.40 or has_actor_overlap(s) or not parsed_performers:
+                            # Safe trust: Either we verified an actor matches, OR the title is a strong match (to prevent same-date collisions)
+                            if has_actor_overlap(s) or ratio >= 0.70:
+                                debug_print(f"✅ Exact Date+Studio match! {fallback_label} (Confidence: {ratio:.2f}): {stash_title} [{stash_date}]")
+                                return s
+                            # If no actors were parsed, we can be a bit more lenient but not 0.40
+                            if not parsed_performers and ratio >= 0.60:
                                 debug_print(f"✅ Exact Date+Studio match! {fallback_label} (Confidence: {ratio:.2f}): {stash_title} [{stash_date}]")
                                 return s
                             
-                        # If the studio doesn't match but the date does, require a moderate title match
-                        if ratio >= 0.65:
+                        # If the studio doesn't match but the date does, require a higher title match
+                        if ratio >= 0.80:
                             debug_print(f"✅ Exact Date match! {fallback_label} (Confidence: {ratio:.2f}): {stash_title} [{stash_date}]")
                             return s
                             
@@ -229,6 +233,11 @@ def query_stashdb(sites, clean_title: str, parsed_performers=None, parsed_dates=
                     return s
                 
                 if ratio >= 0.90:
+                    # Prevent blindly matching extremely short titles (e.g. 1-2 words like "Jessica Rex") 
+                    # if they don't have studio or actor confirmation.
+                    if len(scene_name.split()) <= 3 and not any_studio_matches(s) and not has_actor_overlap(s):
+                        debug_print(f"❌ Pure Title match rejected (too short/generic): '{stash_title}'")
+                        continue
                     debug_print(f"✅ Pure Title match {fallback_label} ({ratio:.2f}): {stash_title}")
                     return s
                     
@@ -243,27 +252,35 @@ def query_stashdb(sites, clean_title: str, parsed_performers=None, parsed_dates=
                     debug_print(f"✅ Czech VR exception trusted: '{stash_title}'")
                     return s
 
-                # ABSOLUTE TRUST: Highly specific combinations that blindly bypass title/studio checks
-                if fallback_label in ["[Actors Only]", "[Studio+Date+Actors]"]:
-                    debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Confidence: {ratio:.2f})")
-                    return s
+                # ABSOLUTE TRUST: Highly specific combinations that blindly bypass standard checks
+                if fallback_label == "[Studio+Date+Actors]":
+                    if has_actor_overlap(s) or ratio >= 0.40:
+                        debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Confidence: {ratio:.2f})")
+                        return s
+                        
+                if fallback_label == "[Actors Only]":
+                    # Absolute trust on just actors is too risky for compilations.
+                    if has_actor_overlap(s) and (any_studio_matches(s) or ratio >= 0.40):
+                        debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Confidence: {ratio:.2f})")
+                        return s
 
                 # Trust highly specific Actor combinations if the studio matches OR the title is close
                 if fallback_label in ["[Studio+Actors]", "[Studio+First Actor]", "[Title+Actors]", "[Title+First Actor]"]:
-                    # STOP BLIND TRUST: Require at least a 0.40 title match even if the studio is right!
+                    # Factor in actor overlap as a massive trust boost
+                    if has_actor_overlap(s) and (any_studio_matches(s) or ratio >= 0.30):
+                        debug_print(f"✅ {fallback_label} Single exact match trusted (Actor overlap verified): '{stash_title}' (Confidence: {ratio:.2f})")
+                        return s
                     if (any_studio_matches(s) and ratio >= 0.40) or ratio >= 0.60:
                         debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Confidence: {ratio:.2f})")
                         return s
 
                 # Trust standard fallbacks if the title is reasonably close
                 if fallback_label in ["[Studio+Title]", "[Studio+Title+Actors]", "[Title+Date]", "[Studio+Date]"]:
-                    if ratio >= 0.60:
+                    if ratio >= 0.60 or (has_actor_overlap(s) and ratio >= 0.40):
                         debug_print(f"✅ {fallback_label} Single exact match trusted: '{stash_title}' (Confidence: {ratio:.2f})")
                         return s
                 else:
                     debug_print(f"❌ Single result found for {fallback_label} but failed sanity check (Title Confidence: {ratio:.2f})")
-                
-            return None
 
         # 1. Primary Search
         scenes = perform_query(search_text)
