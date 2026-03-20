@@ -1,9 +1,68 @@
+# -*- coding: utf-8 -*-
 """
 Filename parsing logic for extracting titles, tags, performers, and site names
 from various video filename formats.
 """
 
+import datetime
 import re
+
+# ---------------------------------------------------------------------------
+# Pre-compiled regex patterns  (biggest CPU win for 200+ video libraries)
+# ---------------------------------------------------------------------------
+
+# parse_filename top-level
+_RE_SCENE_RELEASE = re.compile(
+    r'^([A-Za-z]+(?:[A-Z][a-z]+)*)\s+'       # SiteName (CamelCase)
+    r'(\d{2})\s+(\d{2})\s+(\d{2})\s+'        # YY MM DD
+    r'(.+?)\s+(?:XXX|\d{3,4}p)\b',            # everything until XXX or resolution
+    re.IGNORECASE,
+)
+_RE_CZECH_VR = re.compile(r'(Czech\s*(?:Fetish\s*)?VR)\s*[-_]?\s*(\d+)', re.IGNORECASE)
+_RE_3D_NOISE = re.compile(r'\b(?:version\s*3D|3D)\b', re.IGNORECASE)
+_RE_MULTI_SPACES = re.compile(r'\s{2,}')
+
+# _parse_bracketed
+_RE_LEADING_BRACKET = re.compile(r'^\[([^\]]+)\]')
+_RE_ALL_BRACKETS = re.compile(r'\[([^\]]+)(?:\]|$)')
+_RE_STRIP_BRACKETS = re.compile(r'\[([^\]]*)\]')
+_RE_PAREN_GROUP = re.compile(r'\(([^)]*)\)')
+_RE_FIRST_BRACKET = re.compile(r'\[')
+_RE_DOT_COM = re.compile(r'\.com$', re.IGNORECASE)
+
+# _parse_scene_release
+_RE_CAMEL_SPLIT = re.compile(r'([a-z])([A-Z])')
+_RE_REMASTERED = re.compile(r'\b(REMASTERED|Remastered)\b')
+_RE_TAG_TOKENS = re.compile(r'(VR\d*|VR180|\d{3,4}p|MP4|SideBySide|[A-Z]{2,})')
+_RE_BRACKET_TAGS = re.compile(r'\[([^\]]+)\]')
+
+# _parse_dash_separated
+_RE_TRAILING_RES = re.compile(r'\s+\d{3,4}p\s*$')
+
+# _clean_tag
+_RE_YEAR_TAG = re.compile(r'^\d{4}\s*(г\.?)?$')
+_RE_DATE_TAG = re.compile(r'^\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}$')
+_RE_RES_TAG = re.compile(r'^\d{3,4}p$')
+
+# _clean_title_from_parens
+_RE_TITLE_DATE = re.compile(r'^\d{1,2}[./]\d{1,2}[./]\d{2,4}$')
+_RE_TITLE_ID = re.compile(r'^\d{4,}$')
+_RE_TITLE_YEAR = re.compile(r'^\d{4}\s*(г\.?|year)?$')
+
+# _extract_performers
+_RE_STRIP_PIPE = re.compile(r'\|\|.*$')
+_RE_SPLIT_PERFORMERS = re.compile(r',\s*|\s+&\s+')
+_RE_RES_TOKEN = re.compile(r'^\d+p$')
+
+# _extract_dates
+_RE_DATE_YMD = re.compile(r'\b(20\d{2})[-. /](0[1-9]|1[0-2])[-. /](0[1-9]|[12]\d|3[01])\b')
+_RE_DATE_DMY = re.compile(r'\b(0[1-9]|[12]\d|3[01])[-. /](0[1-9]|[12]\d|3[01])[-. /](20\d{2})\b')
+_RE_DATE_SCENE = re.compile(r'\b(\d{2})\s+(0[1-9]|1[0-2])\s+(0[1-9]|[12]\d|3[01])\b')
+
+# Shared (used in multiple helpers)
+_RE_NOISE_CHARS = re.compile(r'[():\[\],_!?~-]+')
+_RE_RES_K = re.compile(r'\b\d+[kK]\b')
+_RE_POOR_TITLE_NUMERIC = re.compile(r'^\d+$')
 
 
 def parse_filename(filename: str) -> dict:
@@ -21,13 +80,7 @@ def parse_filename(filename: str) -> dict:
         res = _parse_bracketed(filename)
     else:
         # FORMAT 3:  Scene-release style
-        scene_match = re.match(
-            r'^([A-Za-z]+(?:[A-Z][a-z]+)*)\s+'       # SiteName (CamelCase)
-            r'(\d{2})\s+(\d{2})\s+(\d{2})\s+'        # YY MM DD
-            r'(.+?)\s+(?:XXX|\d{3,4}p)\b',            # everything until XXX or resolution
-            filename,
-            re.IGNORECASE
-        )
+        scene_match = _RE_SCENE_RELEASE.match(filename)
         if scene_match:
             res = _parse_scene_release(filename, scene_match)
         # FORMAT 4:  Simple dash-separated
@@ -38,15 +91,13 @@ def parse_filename(filename: str) -> dict:
             res = {"title": filename, "tags": [], "site": "", "performers": []}
 
     # --- Czech VR / Czech Fetish VR Override ---
-    # Looks for "Czech VR 123", "CzechFetishVR-45", etc.
-    czech_match = re.search(r'(Czech\s*(?:Fetish\s*)?VR)\s*[-_]?\s*(\d+)', filename, re.IGNORECASE)
+    czech_match = _RE_CZECH_VR.search(filename)
     if czech_match:
         is_fetish = "fetish" in czech_match.group(1).lower()
         prefix = "Czech Fetish VR" if is_fetish else "Czech VR"
         res["title"] = f"{prefix} {czech_match.group(2)}"
         res["site"] = prefix
-        # We leave the parsed tags and performers intact but overwrite the title/site
-    
+
     if res:
         # Guarantee a 'studios' list exists for all formats
         if "studios" not in res:
@@ -65,11 +116,11 @@ def parse_filename(filename: str) -> dict:
         res["studios"] = list(dict.fromkeys(normalized_studios))
         res["site"] = res["studios"][0] if res["studios"] else ""
         res["possible_dates"] = _extract_dates(filename)
-        
+
         # Strip 3D / version 3D noise from titles
         if res.get("title"):
-            res["title"] = re.sub(r'\b(?:version\s*3D|3D)\b', '', res["title"], flags=re.IGNORECASE).strip()
-            res["title"] = re.sub(r'\s{2,}', ' ', res["title"]).strip()
+            res["title"] = _RE_3D_NOISE.sub('', res["title"]).strip()
+            res["title"] = _RE_MULTI_SPACES.sub(' ', res["title"]).strip()
 
     return res
 
@@ -80,22 +131,21 @@ def _parse_bracketed(filename: str) -> dict:
     metadata sections.
     """
     # --- Extract site name(s) from leading bracket(s) ---
-    # --- Extract site name(s) from leading bracket(s) ---
-    site_match = re.match(r'^\[([^\]]+)\]', filename)
+    site_match = _RE_LEADING_BRACKET.match(filename)
     raw_site = site_match.group(1).strip() if site_match else ""
-    
+
     studios = []
     if raw_site:
         for s in raw_site.split(" / "):
-            studios.append(re.sub(r'\.com$', '', s.strip(), flags=re.IGNORECASE))
-            
+            studios.append(_RE_DOT_COM.sub('', s.strip()))
+
     site = studios[0] if studios else ""
 
     # Remove the leading [site] bracket to work with the rest
     rest = filename[site_match.end():].strip() if site_match else filename
 
     # --- Extract tag brackets (also match unclosed trailing brackets) ---
-    all_brackets = re.findall(r'\[([^\]]+)(?:\]|$)', rest)
+    all_brackets = _RE_ALL_BRACKETS.findall(rest)
 
     tags = []
     for bracket_content in all_brackets:
@@ -106,13 +156,13 @@ def _parse_bracketed(filename: str) -> dict:
                 tags.append(cleaned)
 
     # --- Strip all square-bracket sections to get the "core text" ---
-    core = re.sub(r'\[[^\]]*\]', '', rest).strip()
+    core = _RE_STRIP_BRACKETS.sub('', rest).strip()
 
     # --- Handle || separators (NaughtyAmerica pattern) ---
     if "||" in core:
         before_pipe, after_pipe = core.split("||", 1)
         performers = _extract_performers(before_pipe.strip())
-        paren_match = re.search(r'\(([^)]*)\)', after_pipe)
+        paren_match = _RE_PAREN_GROUP.search(after_pipe)
         if paren_match:
             raw_title = paren_match.group(1).strip()
             title = _clean_title_from_parens(raw_title)
@@ -132,7 +182,7 @@ def _parse_bracketed(filename: str) -> dict:
     title = ""
     performers = []
 
-    paren_match = re.search(r'\(([^)]*)\)', core)
+    paren_match = _RE_PAREN_GROUP.search(core)
     if paren_match:
         raw_title = paren_match.group(1).strip()
         title = _clean_title_from_parens(raw_title)
@@ -145,7 +195,7 @@ def _parse_bracketed(filename: str) -> dict:
         else:
             is_poor_title = (
                 not title
-                or re.match(r'^\d+$', title)
+                or _RE_POOR_TITLE_NUMERIC.match(title)
                 or title.lower() in ("remastered", "a xxx parody", "a porn parody",
                                       "vr porn parody", "cgi")
             )
@@ -156,7 +206,7 @@ def _parse_bracketed(filename: str) -> dict:
                 if performers and title:
                     title = f"{', '.join(performers)} - {title}"
     else:
-        first_bracket = re.search(r'\[', rest)
+        first_bracket = _RE_FIRST_BRACKET.search(rest)
         if first_bracket:
             before_bracket = rest[:first_bracket.start()].strip()
         else:
@@ -192,19 +242,19 @@ def _parse_bracketed(filename: str) -> dict:
 def _parse_scene_release(filename: str, match: re.Match) -> dict:
     """Parse scene-release style filenames."""
     site_raw = match.group(1)
-    site = re.sub(r'([a-z])([A-Z])', r'\1 \2', site_raw)
+    site = _RE_CAMEL_SPLIT.sub(r'\1 \2', site_raw)
 
     performer_and_title = match.group(5).strip()
-    clean_name = re.sub(r'\b(REMASTERED|Remastered)\b', '', performer_and_title).strip()
+    clean_name = _RE_REMASTERED.sub('', performer_and_title).strip()
 
     after_xxx = filename[match.end():]
     tags = []
-    tag_tokens = re.findall(r'(VR\d*|VR180|\d{3,4}p|MP4|SideBySide|[A-Z]{2,})', after_xxx)
+    tag_tokens = _RE_TAG_TOKENS.findall(after_xxx)
     for t in tag_tokens:
         if t not in ("XXX", "MP4"):
             tags.append(t)
 
-    bracket_tags = re.findall(r'\[([^\]]+)\]', after_xxx)
+    bracket_tags = _RE_BRACKET_TAGS.findall(after_xxx)
     for bt in bracket_tags:
         cleaned = bt.strip()
         if cleaned and cleaned not in tags:
@@ -222,16 +272,16 @@ def _parse_dash_separated(filename: str) -> dict:
     """Parse dash-separated filenames."""
     parts = filename.split(" - ")
     site = parts[0].strip() if len(parts) >= 1 else ""
-    site = re.sub(r'\.com$', '', site, flags=re.IGNORECASE)
+    site = _RE_DOT_COM.sub('', site)
     performers = []
     title = ""
 
     if len(parts) >= 3:
         performers = _extract_performers(parts[1])
         title_raw = " - ".join(parts[2:])
-        title = re.sub(r'\s+\d{3,4}p\s*$', '', title_raw).strip()
+        title = _RE_TRAILING_RES.sub('', title_raw).strip()
     elif len(parts) == 2:
-        title = re.sub(r'\s+\d{3,4}p\s*$', '', parts[1]).strip()
+        title = _RE_TRAILING_RES.sub('', parts[1]).strip()
         # If the first part contains a comma or '&', it's highly likely a performer list
         if "," in parts[0] or "&" in parts[0]:
             performers = _extract_performers(parts[0])
@@ -268,11 +318,11 @@ def _clean_title_from_parens(raw: str) -> str:
 
     title_parts = []
     for seg in segments:
-        if re.match(r'^\d{1,2}[./]\d{1,2}[./]\d{2,4}$', seg):
+        if _RE_TITLE_DATE.match(seg):
             continue
-        if re.match(r'^\d{4,}$', seg):
+        if _RE_TITLE_ID.match(seg):
             continue
-        if re.match(r'^\d{4}\s*(г\.?|year)?$', seg):
+        if _RE_TITLE_YEAR.match(seg):
             continue
         title_parts.append(seg)
 
@@ -286,17 +336,17 @@ def _extract_performers(text: str) -> list:
     if not text:
         return []
 
-    text = re.sub(r'\|\|.*$', '', text)
+    text = _RE_STRIP_PIPE.sub('', text)
     text = text.strip()
 
-    names = re.split(r',\s*|\s+&\s+', text)
+    names = _RE_SPLIT_PERFORMERS.split(text)
 
     performers = []
     for name in names:
         name = name.strip()
         if not name:
             continue
-        if re.match(r'^\d+p$', name):
+        if _RE_RES_TOKEN.match(name):
             continue
         if name.upper() in ("VR", "POV", "SBS", "4K", "8K", "XXX"):
             continue
@@ -310,11 +360,11 @@ def _clean_tag(raw: str) -> str:
     tag = raw.strip()
     if not tag:
         return ""
-    if re.match(r'^\d{4}\s*(г\.?)?$', tag):
+    if _RE_YEAR_TAG.match(tag):
         return ""
-    if re.match(r'^\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}$', tag):
+    if _RE_DATE_TAG.match(tag):
         return ""
-    if re.match(r'^\d{3,4}p$', tag):
+    if _RE_RES_TAG.match(tag):
         return ""
     if tag.upper() in ("SITERIP", "SIDEBYIDE"):
         return ""
@@ -325,12 +375,12 @@ def _extract_dates(text: str) -> list:
     possible_dates = []
 
     # 1. YYYY-MM-DD (or YYYY/MM/DD, YYYY.MM.DD)
-    match = re.search(r'\b(20\d{2})[-. /](0[1-9]|1[0-2])[-. /](0[1-9]|[12]\d|3[01])\b', text)
+    match = _RE_DATE_YMD.search(text)
     if match:
         possible_dates.append(f"{match.group(1)}-{match.group(2)}-{match.group(3)}")
 
     # 2. MM.DD.YYYY or DD.MM.YYYY
-    matches = re.findall(r'\b(0[1-9]|[12]\d|3[01])[-. /](0[1-9]|[12]\d|3[01])[-. /](20\d{2})\b', text)
+    matches = _RE_DATE_DMY.findall(text)
     for p1, p2, y in matches:
         # Try US format first: MM-DD-YYYY
         if int(p1) <= 12:
@@ -340,14 +390,13 @@ def _extract_dates(text: str) -> list:
             possible_dates.append(f"{y}-{p2}-{p1}")
 
     # 3. Scene release format: YY MM DD (e.g., 24 01 17)
-    scene_match = re.search(r'\b(\d{2})\s+(0[1-9]|1[0-2])\s+(0[1-9]|[12]\d|3[01])\b', text)
+    scene_match = _RE_DATE_SCENE.search(text)
     if scene_match:
         yy, mm, dd = scene_match.groups()
         if 10 <= int(yy) <= 99:
             possible_dates.append(f"20{yy}-{mm}-{dd}")
 
     # Fuzz the dates by +/- 1 day to handle StashDB timezone differences
-    import datetime
     expanded_dates = set(possible_dates)
     for d in possible_dates:
         try:
