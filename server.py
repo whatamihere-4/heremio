@@ -160,6 +160,7 @@ def _resolve(stremio_id):
         ptube_base=settings.PTUBE_BASE,
         ptube_fallback_base=settings.PTUBE_FALLBACK_BASE,
         rd_token=settings.RD_TOKEN,
+        rd_preferred_cdn=settings.RD_PREFERRED_CDN,
     )
     _STREAM_CACHE[stremio_id] = (streams, now)
     return streams

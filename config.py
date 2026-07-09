@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # Optional with defaults
     DEBUG_MODE: bool = True
     PORT: int = 9000
+    # Pin Real-Debrid CDN host after /unrestrict/link (e.g. nyk7-4 or 45.download.real-debrid.cloud).
+    # Run: python scripts/realdebrid_cdn_speedtest.py
+    RD_PREFERRED_CDN: str = ""
 
     # Derived (set by validator)
     PTUBE_BASE: str = ""
