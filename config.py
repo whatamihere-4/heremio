@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # Optional with defaults
     DEBUG_MODE: bool = True
     PORT: int = 9000
+
+    # How often (in minutes) to re-poll the Stremio library for new items.
+    # Set to 0 to disable periodic refresh (you can still POST /refresh manually).
+    LIBRARY_REFRESH_MINUTES: int = 15
+
     # Pin Real-Debrid CDN host after /unrestrict/link (e.g. nyk7-4 or 45.download.real-debrid.cloud).
     # Run: python scripts/realdebrid_cdn_speedtest.py
     RD_PREFERRED_CDN: str = ""

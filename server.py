@@ -82,10 +82,20 @@ load_cache(debug_mode=settings.DEBUG_MODE)
 # ---------------------------------------------------------------------------
 library_items = []
 item_by_idx   = {}
+_library_lock = threading.RLock()
+
+
+def _ctime_key(item: dict) -> str:
+    """Sort key: when the item was added to the library. Newest first."""
+    return item.get("_ctime") or item.get("_mtime") or ""
 
 
 def fetch_library():
-    """Pull the full Stremio library and pre-cache parsed filenames."""
+    """Pull the full Stremio library and pre-cache parsed filenames.
+
+    The library is sorted newest-first (by Stremio's ``_ctime``) so the first
+    page the user sees in HereSphere is their most-recently-added videos.
+    """
     global library_items, item_by_idx
 
     log.info("📡 Fetching library item IDs from Stremio...")
@@ -110,13 +120,50 @@ def fetch_library():
     movies = [it for it in items if isinstance(it, dict)
               and it.get("type") == "movie" and not it.get("removed")]
 
-    # Cache parsed filenames on every item (eliminates repeated parsing)
+    movies.sort(key=_ctime_key, reverse=True)
+
     for item in movies:
         item["_parsed"] = parse_filename(item.get("name", ""))
 
-    library_items = movies
-    item_by_idx = {i: m for i, m in enumerate(movies)}
-    log.info("✅ Library loaded: %d movies", len(movies))
+    with _library_lock:
+        library_items = movies
+        item_by_idx = {i: m for i, m in enumerate(movies)}
+    log.info("✅ Library loaded: %d movies (newest first)", len(movies))
+
+
+def _library_refresh_loop(interval_minutes: int):
+    """Background worker that re-polls the Stremio library on a fixed interval.
+
+    After each refresh, any newly-added items are queued for StashDB caching
+    so metadata/tags populate without the user restarting the server.
+    """
+    interval_s = max(1, interval_minutes) * 60
+    log.info("🔁 Library auto-refresh enabled: every %d min", interval_minutes)
+    while True:
+        time.sleep(interval_s)
+        try:
+            with _library_lock:
+                prev_ids = {it.get("_id") for it in library_items}
+            fetch_library()
+            with _library_lock:
+                new_items = [it for it in library_items if it.get("_id") not in prev_ids]
+
+            if new_items:
+                log.info("🆕 Library refresh: %d new item(s)", len(new_items))
+                if settings.STASHDB_API_KEY:
+                    threading.Thread(
+                        target=fill_stash_cache_background,
+                        args=(new_items, parse_filename),
+                        kwargs={
+                            "api_key": settings.STASHDB_API_KEY,
+                            "debug_mode": settings.DEBUG_MODE,
+                        },
+                        daemon=True,
+                    ).start()
+            else:
+                log.debug("Library refresh: no new items")
+        except Exception as e:
+            log.warning("Library auto-refresh failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -192,15 +239,17 @@ def hs_response(data: dict, status=200):
 
 @app.route("/heresphere", methods=["GET", "POST"])
 def heresphere_index():
-    """Library index — lists all videos."""
+    """Library index — lists all videos, newest first."""
     base = request.host_url.rstrip("/")
-    video_list = [f"{base}/heresphere/{i}" for i in range(len(library_items))]
+    with _library_lock:
+        count = len(library_items)
+    video_list = [f"{base}/heresphere/{i}" for i in range(count)]
 
     return hs_response({
         "access": 1,
         "library": [
             {
-                "name": "Stremio Library",
+                "name": "Stremio Library (Newest First)",
                 "list": video_list
             }
         ]
@@ -210,7 +259,8 @@ def heresphere_index():
 @app.route("/heresphere/<int:idx>", methods=["GET", "POST"])
 def heresphere_video(idx: int):
     """Video data endpoint — returns metadata and optionally media sources."""
-    item = item_by_idx.get(idx)
+    with _library_lock:
+        item = item_by_idx.get(idx)
     if not item:
         return hs_response({"error": "not found"}, 404)
 
@@ -232,7 +282,7 @@ def heresphere_video(idx: int):
         images = stash_data.get("images", [])
         if images:
             poster = images[0].get("url", poster)
-        
+
         for performer in stash_data.get("performers", []):
             p_name = performer.get("performer", {}).get("name")
             if p_name:
@@ -339,7 +389,10 @@ def library_ui():
     """Web UI to browse video library with StashDB data."""
     all_items = []
 
-    for i, item in enumerate(library_items):
+    with _library_lock:
+        snapshot = list(enumerate(library_items))
+
+    for i, item in snapshot:
         raw_name = item.get("name", "")
         if not raw_name:
             continue
@@ -404,13 +457,21 @@ def root():
 if __name__ == "__main__":
     fetch_library()
 
-    # Start background StashDB caching thread
     threading.Thread(
         target=fill_stash_cache_background,
         args=(library_items, parse_filename),
         kwargs={"api_key": settings.STASHDB_API_KEY, "debug_mode": settings.DEBUG_MODE},
         daemon=True,
     ).start()
+
+    if settings.LIBRARY_REFRESH_MINUTES > 0:
+        threading.Thread(
+            target=_library_refresh_loop,
+            args=(settings.LIBRARY_REFRESH_MINUTES,),
+            daemon=True,
+        ).start()
+    else:
+        log.info("🔁 Library auto-refresh disabled (LIBRARY_REFRESH_MINUTES=0)")
 
     log.info("🚀 HereSphere bridge running on http://0.0.0.0:%d/heresphere", settings.PORT)
     log.info("   Point HereSphere to:  http://<YOUR_LAN_IP>:%d/heresphere", settings.PORT)
