@@ -9,6 +9,7 @@ import logging
 import re
 import threading
 import time
+from urllib.parse import quote, unquote
 
 import requests
 from datetime import datetime
@@ -81,8 +82,13 @@ load_cache(debug_mode=settings.DEBUG_MODE)
 # Stremio library
 # ---------------------------------------------------------------------------
 library_items = []
-item_by_idx   = {}
+item_by_id  = {}
 _library_lock = threading.RLock()
+
+
+def _video_url(base: str, stremio_id: str) -> str:
+    """Build a stable HereSphere video URL keyed by Stremio library ID."""
+    return f"{base}/heresphere/{quote(stremio_id, safe='')}"
 
 
 def _ctime_key(item: dict) -> str:
@@ -96,7 +102,7 @@ def fetch_library():
     The library is sorted newest-first (by Stremio's ``_ctime``) so the first
     page the user sees in HereSphere is their most-recently-added videos.
     """
-    global library_items, item_by_idx
+    global library_items, item_by_id
 
     log.info("📡 Fetching library item IDs from Stremio...")
     meta = requests.post(f"{STREMIO_API}/datastoreMeta", json={
@@ -127,7 +133,7 @@ def fetch_library():
 
     with _library_lock:
         library_items = movies
-        item_by_idx = {i: m for i, m in enumerate(movies)}
+        item_by_id = {m["_id"]: m for m in movies if m.get("_id")}
     log.info("✅ Library loaded: %d movies (newest first)", len(movies))
 
 
@@ -242,8 +248,7 @@ def heresphere_index():
     """Library index — lists all videos, newest first."""
     base = request.host_url.rstrip("/")
     with _library_lock:
-        count = len(library_items)
-    video_list = [f"{base}/heresphere/{i}" for i in range(count)]
+        video_list = [_video_url(base, m["_id"]) for m in library_items if m.get("_id")]
 
     return hs_response({
         "access": 1,
@@ -256,11 +261,12 @@ def heresphere_index():
     })
 
 
-@app.route("/heresphere/<int:idx>", methods=["GET", "POST"])
-def heresphere_video(idx: int):
+@app.route("/heresphere/<path:video_id>", methods=["GET", "POST"])
+def heresphere_video(video_id: str):
     """Video data endpoint — returns metadata and optionally media sources."""
+    stremio_id = unquote(video_id)
     with _library_lock:
-        item = item_by_idx.get(idx)
+        item = item_by_id.get(stremio_id)
     if not item:
         return hs_response({"error": "not found"}, 404)
 
@@ -390,12 +396,13 @@ def library_ui():
     all_items = []
 
     with _library_lock:
-        snapshot = list(enumerate(library_items))
+        snapshot = list(library_items)
 
-    for i, item in snapshot:
+    for item in snapshot:
         raw_name = item.get("name", "")
         if not raw_name:
             continue
+        stremio_id = item.get("_id", "")
         parsed = item.get("_parsed") or parse_filename(raw_name)
         site = parsed.get("site", "")
         title = parsed.get("title", "")
@@ -424,7 +431,7 @@ def library_ui():
                     stash_poster = images[0].get("url", "")
 
         all_items.append({
-            "idx": i,
+            "id": stremio_id,
             "raw_name": raw_name,
             "parsed_title": title,
             "parsed_site": site,

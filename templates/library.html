@@ -64,7 +64,7 @@
     </div>
     <div class="grid" id="grid">
         {% for v in items %}
-        <div class="card" data-idx="{{ v.idx }}" data-status="{{ v.status }}" data-search="{{ v.parsed_site }} {{ v.parsed_title }} {{ v.performers|join(' ') }}" onclick="openModal({{ v.idx }})">
+        <div class="card" data-id="{{ v.id }}" data-status="{{ v.status }}" data-search="{{ v.parsed_site }} {{ v.parsed_title }} {{ v.performers|join(' ') }}" onclick="openModal({{ v.id|tojson }})">
             <img src="{{ v.poster }}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22300%22><rect fill=%22%23222%22 width=%22200%22 height=%22300%22/><text x=%2250%25%22 y=%2250%25%22 fill=%22%23555%22 font-size=%2214%22 text-anchor=%22middle%22 dy=%22.3em%22>No Image</text></svg>'">
             <span class="badge {{ v.status }}">{{ v.status }}</span>
             <div class="info">
@@ -96,9 +96,14 @@
             document.getElementById('stats').textContent = visibleCount + ' videos';
         }
 
-        function openModal(idx) {
-            const v = items.find(i => i.idx === idx);
+        function domId(id) {
+            return 'vid-' + btoa(unescape(encodeURIComponent(id))).replace(/[+/=]/g, '_');
+        }
+
+        function openModal(id) {
+            const v = items.find(i => i.id === id);
             if (!v) return;
+            const elId = domId(id);
             const perfHtml = v.performers.length ? v.performers.map(p => `<span class="tag performer">${p}</span>`).join('') : '<span style="color:#555">None</span>';
             const tagsHtml = v.tags.length ? v.tags.map(t => `<span class="tag">${t}</span>`).join('') : '<span style="color:#555">None</span>';
             const stashInfo = v.status === 'matched'
@@ -134,10 +139,10 @@
                     <h3>Tags</h3>
                     <div class="tag-list">${tagsHtml}</div>
                     <div class="match-row">
-                        <input type="text" id="matchUrl-${idx}" placeholder="Paste StashDB scene URL to re-match...">
-                        <button onclick="doMatch(${idx})">Match</button>
+                        <input type="text" id="matchUrl-${elId}" placeholder="Paste StashDB scene URL to re-match...">
+                        <button onclick="doMatch(${JSON.stringify(id)})">Match</button>
                     </div>
-                    <div class="match-msg" id="matchMsg-${idx}"></div>
+                    <div class="match-msg" id="matchMsg-${elId}"></div>
                     <div class="raw-name">${v.raw_name}</div>
                 </div>`;
             document.getElementById('overlay').classList.add('active');
@@ -148,10 +153,11 @@
         }
         document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
-        async function doMatch(idx) {
-            const v = items.find(i => i.idx === idx);
-            const url = document.getElementById('matchUrl-' + idx).value;
-            const msg = document.getElementById('matchMsg-' + idx);
+        async function doMatch(id) {
+            const v = items.find(i => i.id === id);
+            const elId = domId(id);
+            const url = document.getElementById('matchUrl-' + elId).value;
+            const msg = document.getElementById('matchMsg-' + elId);
             if (!url) { msg.innerHTML = '❌ Paste a URL first'; msg.style.color = '#f44336'; return; }
             msg.innerHTML = 'Saving...'; msg.style.color = '#aaa';
             try {
@@ -164,7 +170,7 @@
                 if (data.success) {
                     msg.innerHTML = '✅ Matched: ' + data.title;
                     msg.style.color = '#4caf50';
-                    const card = document.querySelector(`.card[data-idx="${idx}"]`);
+                    const card = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
                     if (card) {
                         card.querySelector('.badge').className = 'badge matched';
                         card.querySelector('.badge').textContent = 'matched';
