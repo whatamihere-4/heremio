@@ -64,7 +64,7 @@
     </div>
     <div class="grid" id="grid">
         {% for v in items %}
-        <div class="card" data-id="{{ v.id }}" data-status="{{ v.status }}" data-search="{{ v.parsed_site }} {{ v.parsed_title }} {{ v.performers|join(' ') }}" onclick="openModal({{ v.id|tojson }})">
+        <div class="card" data-id="{{ v.id }}" data-status="{{ v.status }}" data-search="{{ v.parsed_site }} {{ v.parsed_title }} {{ v.performers|join(' ') }}">
             <img src="{{ v.poster }}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22300%22><rect fill=%22%23222%22 width=%22200%22 height=%22300%22/><text x=%2250%25%22 y=%2250%25%22 fill=%22%23555%22 font-size=%2214%22 text-anchor=%22middle%22 dy=%22.3em%22>No Image</text></svg>'">
             <span class="badge {{ v.status }}">{{ v.status }}</span>
             <div class="info">
@@ -81,6 +81,12 @@
 
     <script>
         const items = {{ items_json|safe }};
+        const itemsById = Object.fromEntries(items.map(i => [i.id, i]));
+
+        document.getElementById('grid').addEventListener('click', e => {
+            const card = e.target.closest('.card');
+            if (card) openModal(card.dataset.id);
+        });
 
         function filterCards() {
             const q = document.getElementById('search').value.toLowerCase();
@@ -101,7 +107,7 @@
         }
 
         function openModal(id) {
-            const v = items.find(i => i.id === id);
+            const v = itemsById[id];
             if (!v) return;
             const elId = domId(id);
             const perfHtml = v.performers.length ? v.performers.map(p => `<span class="tag performer">${p}</span>`).join('') : '<span style="color:#555">None</span>';
@@ -140,7 +146,7 @@
                     <div class="tag-list">${tagsHtml}</div>
                     <div class="match-row">
                         <input type="text" id="matchUrl-${elId}" placeholder="Paste StashDB scene URL to re-match...">
-                        <button onclick="doMatch(${JSON.stringify(id)})">Match</button>
+                        <button type="button" class="match-btn" data-video-id="${id}">Match</button>
                     </div>
                     <div class="match-msg" id="matchMsg-${elId}"></div>
                     <div class="raw-name">${v.raw_name}</div>
@@ -153,8 +159,16 @@
         }
         document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
+        document.getElementById('overlay').addEventListener('click', e => {
+            const btn = e.target.closest('.match-btn');
+            if (btn) {
+                e.stopPropagation();
+                doMatch(btn.dataset.videoId);
+            }
+        });
+
         async function doMatch(id) {
-            const v = items.find(i => i.id === id);
+            const v = itemsById[id];
             const elId = domId(id);
             const url = document.getElementById('matchUrl-' + elId).value;
             const msg = document.getElementById('matchMsg-' + elId);
