@@ -1,0 +1,14 @@
+services:
+  heremio:
+    build: .
+    container_name: heremio
+    restart: unless-stopped
+    ports:
+      - "${PORT:-9000}:${PORT:-9000}"
+    env_file:
+      - .env
+    volumes:
+      - stashdb_cache:/app/cache.json
+
+volumes:
+  stashdb_cache:
