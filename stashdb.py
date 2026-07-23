@@ -30,6 +30,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from config import settings
+
 log = logging.getLogger("heremio.stashdb")
 
 # ---------------------------------------------------------------------------
@@ -56,7 +58,7 @@ _RE_STASHDB_URL = re.compile(r'stashdb\.org/scenes/([a-f0-9\-]+)')
 # ---------------------------------------------------------------------------
 # Cache state
 # ---------------------------------------------------------------------------
-CACHE_FILE = "cache.json"
+CACHE_FILE = settings.CACHE_FILE
 STASH_CACHE = {}        # {"Site - Title": stashdb_dict_or_None}
 STASH_PENDING = set()   # keys currently being queried (thread safety)
 _cache_lock = threading.Lock()
@@ -82,6 +84,9 @@ def save_cache():
     """Persist the cache to disk (thread-safe)."""
     with _cache_lock:
         try:
+            cache_dir = os.path.dirname(CACHE_FILE)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(STASH_CACHE, f, indent=2)
         except Exception as e:

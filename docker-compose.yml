@@ -7,8 +7,10 @@ services:
       - "${PORT:-9000}:${PORT:-9000}"
     env_file:
       - .env
+    environment:
+      CACHE_FILE: /app/data/cache.json
     volumes:
-      - stashdb_cache:/app/cache.json
+      - stashdb_cache:/app/data
 
 volumes:
   stashdb_cache:

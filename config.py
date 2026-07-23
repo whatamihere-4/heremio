@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # Optional with defaults
     DEBUG_MODE: bool = True
     PORT: int = 9000
+    CACHE_FILE: str = "cache.json"
 
     # How often (in minutes) to re-poll the Stremio library for new items.
     # Set to 0 to disable periodic refresh (you can still POST /refresh manually).
