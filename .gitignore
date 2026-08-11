@@ -3,3 +3,5 @@ test/
 __pycache__
 heremio.xml
 cache.json
+cache/
+data/

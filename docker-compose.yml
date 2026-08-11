@@ -8,9 +8,6 @@ services:
     env_file:
       - .env
     environment:
-      CACHE_FILE: /app/data/cache.json
+      CACHE_FILE: /app/cache/scenes.json
     volumes:
-      - stashdb_cache:/app/data
-
-volumes:
-  stashdb_cache:
+      - ./cache:/app/cache

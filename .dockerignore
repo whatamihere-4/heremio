@@ -4,5 +4,7 @@
 __pycache__
 *.pyc
 cache.json
+cache/
+data/
 test/
 heremio.xml
