@@ -63,7 +63,7 @@ def rd_api(method, endpoint, *, rd_token, data=None):
         return None
 
 
-def resolve_infohash_rd(info_hash, *, rd_token, rd_preferred_cdn=""):
+def resolve_infohash_rd(info_hash, *, rd_token):
     """Adds magnet to RD, selects files, waits for links, and unrestricts them."""
     magnet = f"magnet:?xt=urn:btih:{info_hash}"
     log.info("  🧲 Starting Real-Debrid resolution for infoHash: %s", info_hash)
@@ -123,10 +123,7 @@ def resolve_infohash_rd(info_hash, *, rd_token, rd_preferred_cdn=""):
         if unrestrict and unrestrict.get("download"):
             size_mb = unrestrict.get("filesize", 0) / (1024*1024)
             filename = unrestrict.get("filename", "")
-            download_url = apply_preferred_cdn(
-                unrestrict["download"],
-                preferred_cdn=rd_preferred_cdn or None,
-            )
+            download_url = apply_preferred_cdn(unrestrict["download"])
             log.debug("Successfully unrestricted! Final direct URL: %s", download_url)
             streams.append({
                 "url": download_url,
@@ -155,7 +152,7 @@ def get_ptube_streams(url):
         return []
 
 
-def resolve_streams(stremio_id: str, *, ptube_base, ptube_fallback_base, rd_token, rd_preferred_cdn=""):
+def resolve_streams(stremio_id: str, *, ptube_base, ptube_fallback_base, rd_token):
     """
     Ask the PTube addon for streams for a given Stremio content ID.
     Falls back to torrent resolution via Real-Debrid when no direct URLs exist.
@@ -184,9 +181,7 @@ def resolve_streams(stremio_id: str, *, ptube_base, ptube_fallback_base, rd_toke
                 continue
             tried_hashes.add(h)
             log.debug("Trying infoHash: %s", h)
-            rd_streams = resolve_infohash_rd(
-                h, rd_token=rd_token, rd_preferred_cdn=rd_preferred_cdn,
-            )
+            rd_streams = resolve_infohash_rd(h, rd_token=rd_token)
             if rd_streams:
                 log.debug("Successfully resolved RD streams from primary torrents.")
                 return rd_streams
@@ -204,9 +199,7 @@ def resolve_streams(stremio_id: str, *, ptube_base, ptube_fallback_base, rd_toke
                     continue
                 tried_hashes.add(h)
                 log.debug("Fallback torrent found. Trying infoHash: %s", h)
-                rd_streams = resolve_infohash_rd(
-                    h, rd_token=rd_token, rd_preferred_cdn=rd_preferred_cdn,
-                )
+                rd_streams = resolve_infohash_rd(h, rd_token=rd_token)
                 if rd_streams:
                     log.debug("Successfully resolved RD streams from fallback torrents.")
                     return rd_streams

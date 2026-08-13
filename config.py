@@ -34,6 +34,7 @@ class Settings(BaseSettings):
 
     # Pin Real-Debrid CDN host after /unrestrict/link (e.g. nyk7-4 or 45.download.real-debrid.cloud).
     # Run: python scripts/realdebrid_cdn_speedtest.py
+    # When unset, background scan auto-picks the fastest host (see RD_AUTO_SCAN in .env).
     RD_PREFERRED_CDN: str = ""
 
     # Derived (set by validator)

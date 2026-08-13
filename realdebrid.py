@@ -19,6 +19,8 @@ import requests
 
 log = logging.getLogger("heremio.realdebrid")
 
+_RUNTIME_PREFERRED_CDN_RAW = ""
+
 _CDN_HOST_RE = re.compile(
     r"(?:^|\.)("
     r"download\.real-debrid\.(?:com|cloud)"
@@ -83,13 +85,23 @@ def normalize_cdn_host(raw: str) -> str:
     return _normalize_cdn_host(raw)
 
 
-def _preferred_cdn_raw(explicit: str | None = None) -> str:
-    if explicit is not None:
-        return explicit.strip()
+def set_runtime_preferred_cdn(raw: str) -> None:
+    """Set preferred CDN hosts for this process (used by background scan)."""
+    global _RUNTIME_PREFERRED_CDN_RAW
+    _RUNTIME_PREFERRED_CDN_RAW = (raw or "").strip()
+
+
+def _env_pinned_cdn_raw() -> str:
     return (
         (os.environ.get("RD_PREFERRED_CDN") or "").strip()
         or (os.environ.get("REAL_DEBRID_PREFERRED_CDN") or "").strip()
     )
+
+
+def _preferred_cdn_raw(explicit: str | None = None) -> str:
+    if explicit is not None:
+        return explicit.strip()
+    return _env_pinned_cdn_raw() or _RUNTIME_PREFERRED_CDN_RAW
 
 
 def preferred_cdn_hosts(*, preferred_cdn: str | None = None) -> list[str]:

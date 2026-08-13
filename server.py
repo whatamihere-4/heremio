@@ -23,6 +23,7 @@ from stashdb import (
     _RE_STASHDB_URL,
 )
 from streams import resolve_streams, streams_to_media
+from server_scan import get_scan_status, start_background_server_scan
 
 log = logging.getLogger("heremio.server")
 
@@ -213,7 +214,6 @@ def _resolve(stremio_id):
         ptube_base=settings.PTUBE_BASE,
         ptube_fallback_base=settings.PTUBE_FALLBACK_BASE,
         rd_token=settings.RD_TOKEN,
-        rd_preferred_cdn=settings.RD_PREFERRED_CDN,
     )
     _STREAM_CACHE[stremio_id] = (streams, now)
     return streams
@@ -454,7 +454,8 @@ def root():
     return jsonify({
         "status": "running",
         "library_size": len(library_items),
-        "heresphere_url": f"{request.host_url}heresphere"
+        "heresphere_url": f"{request.host_url}heresphere",
+        "rd_cdn_scan": get_scan_status(),
     })
 
 
@@ -463,6 +464,7 @@ def root():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     fetch_library()
+    start_background_server_scan()
 
     threading.Thread(
         target=fill_stash_cache_background,
