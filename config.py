@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # When unset, background scan auto-picks the fastest host (see RD_AUTO_SCAN in .env).
     RD_PREFERRED_CDN: str = ""
 
+    # Serve HereSphere thumbnails through /thumb/<id> instead of handing the
+    # headset the upstream URL. Fetches run concurrently and are prefetched on
+    # library load. Required for webp conversion (see later layers).
+    THUMB_PROXY: bool = False
+    # Parallel upstream fetches when prefetching thumbnails.
+    THUMB_WORKERS: int = 8
+
     # Derived (set by validator)
     PTUBE_BASE: str = ""
     PTUBE_FALLBACK_BASE: str = ""

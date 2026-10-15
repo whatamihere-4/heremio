@@ -25,6 +25,7 @@ from stashdb import (
 )
 from streams import resolve_streams, streams_to_media
 from server_scan import get_scan_status, start_background_server_scan
+import thumbs
 
 log = logging.getLogger("heremio.server")
 
@@ -93,6 +94,27 @@ def _video_url(base: str, stremio_id: str) -> str:
     return f"{base}/heresphere/{quote(stremio_id, safe='')}"
 
 
+def _poster_url(item: dict) -> str:
+    """Upstream poster for an item: the matched StashDB image, else Stremio's."""
+    poster = item.get("poster", "")
+    parsed = item.get("_parsed") or parse_filename(item.get("name", "Unknown"))
+    stash_data = STASH_CACHE.get(f"{parsed['site']} - {parsed['title']}")
+    if stash_data:
+        images = stash_data.get("images", [])
+        if images:
+            poster = images[0].get("url", poster)
+    return poster
+
+
+def _prefetch_thumbs():
+    """Warm the thumbnail proxy for the current library (no-op if proxy is off)."""
+    if not settings.THUMB_PROXY:
+        return
+    with _library_lock:
+        urls = [_poster_url(m) for m in library_items]
+    thumbs.prefetch(urls, settings.THUMB_WORKERS)
+
+
 def _ctime_key(item: dict) -> str:
     """Sort key: when the item was added to the library. Newest first."""
     return item.get("_ctime") or item.get("_mtime") or ""
@@ -153,6 +175,7 @@ def _library_refresh_loop(interval_minutes: int):
             with _library_lock:
                 prev_ids = {it.get("_id") for it in library_items}
             fetch_library()
+            _prefetch_thumbs()
             with _library_lock:
                 new_items = [it for it in library_items if it.get("_id") not in prev_ids]
 
@@ -273,7 +296,6 @@ def heresphere_video(video_id: str):
         return hs_response({"error": "not found"}, 404)
 
     raw_name = item.get("name", "Unknown")
-    poster = item.get("poster", "")
     date_added = parse_date(item.get("_ctime", ""))
     stremio_id = item.get("_id", "")
 
@@ -287,10 +309,6 @@ def heresphere_video(video_id: str):
 
     hs_tags = []
     if stash_data:
-        images = stash_data.get("images", [])
-        if images:
-            poster = images[0].get("url", poster)
-
         for performer in stash_data.get("performers", []):
             p_name = performer.get("performer", {}).get("name")
             if p_name:
@@ -305,6 +323,10 @@ def heresphere_video(video_id: str):
         else:
             log.debug("Using local backup tags for: %s", title)
         hs_tags = [{"name": t, "start": 0, "end": 0} for t in parsed["tags"]]
+
+    poster = _poster_url(item)
+    if settings.THUMB_PROXY and poster:
+        poster = f"{request.host_url.rstrip('/')}/thumb/{quote(stremio_id, safe='')}"
 
     duration_ms = 0
     state = item.get("state", {})
@@ -354,10 +376,32 @@ def heresphere_video(video_id: str):
     return hs_response(resp)
 
 
+@app.route("/thumb/<path:video_id>", methods=["GET"])
+def thumb(video_id: str):
+    """Proxied thumbnail for a library item."""
+    if not settings.THUMB_PROXY:
+        return make_response("thumbnail proxy disabled", 404)
+    with _library_lock:
+        item = item_by_id.get(unquote(video_id))
+    url = _poster_url(item) if item else ""
+    if not url:
+        return make_response("not found", 404)
+    try:
+        data, mime = thumbs.get_thumb(url)
+    except Exception as e:
+        log.warning("Thumbnail fetch failed for %s: %s", url, e)
+        return make_response("upstream error", 502)
+    resp = make_response(data)
+    resp.headers["Content-Type"] = mime
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 @app.route("/refresh", methods=["GET", "POST"])
 def refresh():
     """Re-fetch the Stremio library."""
     fetch_library()
+    _prefetch_thumbs()
     return jsonify({"status": "ok", "count": len(library_items)})
 
 
@@ -466,6 +510,7 @@ def root():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     fetch_library()
+    _prefetch_thumbs()
     start_background_server_scan()
 
     threading.Thread(
