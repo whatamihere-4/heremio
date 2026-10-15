@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     # Parallel upstream fetches when prefetching thumbnails.
     THUMB_WORKERS: int = 8
 
+    # Opt-in on-disk thumbnail cache (only used with THUMB_PROXY). Empty = off.
+    # In Docker use a path under the bind-mounted cache dir, e.g. /app/cache/thumbs.
+    THUMB_CACHE_DIR: str = ""
+    # Delete cached thumbnails not accessed for this many days. 0 = keep forever.
+    THUMB_CACHE_TTL_DAYS: float = 0
+
     # Derived (set by validator)
     PTUBE_BASE: str = ""
     PTUBE_FALLBACK_BASE: str = ""

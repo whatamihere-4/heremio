@@ -509,6 +509,8 @@ def root():
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    if settings.THUMB_PROXY:
+        thumbs.configure(settings.THUMB_CACHE_DIR, settings.THUMB_CACHE_TTL_DAYS)
     fetch_library()
     _prefetch_thumbs()
     start_background_server_scan()
