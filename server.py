@@ -14,6 +14,7 @@ from urllib.parse import quote, unquote
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify, make_response, render_template
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import settings
 from parse_filename import parse_filename
@@ -233,6 +234,7 @@ def _query_stashdb_by_id(scene_id):
 # Flask app
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 
 def hs_response(data: dict, status=200):
