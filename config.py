@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # Parallel upstream fetches when prefetching thumbnails.
     THUMB_WORKERS: int = 8
 
+    # Convert webp thumbnails to jpeg when proxying (needs THUMB_PROXY).
+    # Some headsets' HereSphere builds can't render webp.
+    THUMB_CONVERT_WEBP: bool = True
+
     # Opt-in on-disk thumbnail cache (only used with THUMB_PROXY). Empty = off.
     # In Docker use a path under the bind-mounted cache dir, e.g. /app/cache/thumbs.
     THUMB_CACHE_DIR: str = ""

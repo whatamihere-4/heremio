@@ -8,6 +8,7 @@ time, and (in later layers) cache and convert formats the headset can't render.
 """
 
 import hashlib
+import io
 import logging
 import os
 import threading
@@ -30,6 +31,9 @@ _mem_lock = threading.Lock()
 # Optional on-disk cache (opt-in via ``configure``). Files are named by URL hash;
 # mtime doubles as "last accessed" and is bumped on every hit.
 _cache_dir = ""
+
+# Convert webp -> jpeg (HereSphere on some headsets can't decode webp).
+_convert_webp = False
 
 # One lock per URL so concurrent requests for the same thumb fetch it once.
 _locks = {}
@@ -74,9 +78,10 @@ def _mem_put(key: str, data: bytes) -> None:
             _mem.popitem(last=False)
 
 
-def configure(cache_dir: str, ttl_days: float) -> None:
-    """Enable the disk cache and, if ``ttl_days`` > 0, the stale-file sweeper."""
-    global _cache_dir
+def configure(cache_dir: str, ttl_days: float, convert_webp: bool = False) -> None:
+    """Set up conversion, the disk cache and, if ``ttl_days`` > 0, the stale-file sweeper."""
+    global _cache_dir, _convert_webp
+    _convert_webp = convert_webp
     if not cache_dir:
         return
     os.makedirs(cache_dir, exist_ok=True)
@@ -153,6 +158,26 @@ def _sweep_loop(max_age_s: float) -> None:
         time.sleep(interval)
 
 
+def _webp_to_jpeg(data: bytes) -> bytes:
+    """Re-encode webp as jpeg; returns the original bytes if conversion fails."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            if im.mode in ("RGBA", "LA", "P"):
+                im = im.convert("RGBA")
+                bg = Image.new("RGB", im.size, (0, 0, 0))
+                bg.paste(im, mask=im.getchannel("A"))
+                im = bg
+            else:
+                im = im.convert("RGB")
+            out = io.BytesIO()
+            im.save(out, "JPEG", quality=90)
+            return out.getvalue()
+    except Exception as e:
+        log.warning("webp -> jpeg conversion failed: %s", e)
+        return data
+
+
 def _fetch(url: str) -> bytes:
     resp = _SESSION.get(url, timeout=_FETCH_TIMEOUT)
     resp.raise_for_status()
@@ -172,6 +197,8 @@ def get_thumb(url: str):
                 data = _disk_get(key)
                 if data is None:
                     data = _fetch(url)
+                    if _convert_webp and sniff_mime(data) == "image/webp":
+                        data = _webp_to_jpeg(data)
                     _disk_put(key, data)
                 _mem_put(key, data)
     return data, sniff_mime(data)
